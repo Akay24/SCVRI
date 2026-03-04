@@ -1,0 +1,680 @@
+# =============================================================================
+# SCVRI Platform — Supply Chain Visibility Service
+# Module: 03_services/visibility_service
+# Language: Python 3.12 / FastAPI
+# SRS Coverage: VIS-FR-001..012, NFR-PERF-001..008, NFR-SCAL-001
+# =============================================================================
+
+service:
+  name: visibility-service
+  language: python
+  framework: fastapi
+  version: "1.0.0"
+  port: 8001
+  grpc_port: 9001
+
+# =============================================================================
+# 1. RESPONSIBILITIES
+# =============================================================================
+responsibilities:
+  - Aggregate and normalize shipment tracking events from TMS/carrier APIs
+  - Maintain real-time supply chain map (Tier 1/2/3 supplier graph)
+  - Ingest and process IoT sensor telemetry (temperature, humidity, GPS, shock)
+  - Monitor inventory levels and days-of-supply per SKU/warehouse
+  - Track PO lifecycle state transitions
+  - Detect lead time deviations and emit deviation events
+  - Calculate spend-at-risk for suppliers with active disruptions
+  - Provide historical supply chain state playback (VIS-FR-012)
+  - Expose graph traversal APIs for supply chain network queries
+
+# =============================================================================
+# 2. DATA CONTRACTS — Service-owned tables (see core_domain_model.sql)
+# =============================================================================
+owns_tables:
+  - supply.suppliers
+  - supply.supplier_relationships
+  - supply.purchase_orders
+  - supply.po_line_items
+  - supply.shipments
+  - supply.iot_telemetry
+  - supply.inventory_snapshots
+
+reads_tables:
+  - risk.supplier_risk_scores    (read-only for enrichment)
+  - core.tenants
+  - core.users
+
+# =============================================================================
+# 3. KAFKA CONSUMPTION
+# =============================================================================
+consumes:
+  - topic: scvri.ingestion.tms_tracking
+    consumer_group: visibility-service
+    processing: async_batch
+    batch_size: 200
+    parallelism: 8                   # 8 consumer threads / pod
+  - topic: scvri.ingestion.erp_events
+    consumer_group: visibility-service
+    filter_types: [po_created, po_updated, po_cancelled, grn_created, asn_received, supplier_master_updated]
+  - topic: scvri.ingestion.iot_telemetry
+    consumer_group: visibility-service-iot
+    parallelism: 16
+
+produces:
+  - topic: scvri.visibility.shipment_events
+  - topic: scvri.visibility.iot_breach_events
+  - topic: scvri.visibility.po_lifecycle_events
+  - topic: scvri.visibility.lead_time_deviation_events
+
+# =============================================================================
+# 4. REST API SPECIFICATION
+# =============================================================================
+api:
+  base_path: /api/v1/visibility
+  auth: bearer_jwt + tenant_context (X-Tenant-ID header)
+  rate_limit: 1000 req/min per tenant (burst: 2000)
+
+  endpoints:
+
+    # -------------------------------------------------------------------------
+    # Supply Chain Map (VIS-FR-001)
+    # -------------------------------------------------------------------------
+    - method: GET
+      path: /supply-chain-map
+      description: >
+        Returns the supply chain graph for the tenant.
+        Supports traversal depth (tier=1|2|3), geographic filtering,
+        and risk overlay (include_risk_scores=true).
+      query_params:
+        - name: tier
+          type: integer
+          enum: [1, 2, 3]
+          default: 1
+        - name: supplier_ids
+          type: array[uuid]
+          description: Filter to specific supplier nodes
+        - name: category
+          type: string
+        - name: country_codes
+          type: array[string]
+        - name: include_risk_scores
+          type: boolean
+          default: false
+        - name: include_spend
+          type: boolean
+          default: false
+      response:
+        type: object
+        properties:
+          nodes:
+            type: array
+            items:
+              type: object
+              properties:
+                supplier_id: {type: string, format: uuid}
+                legal_name: {type: string}
+                country_code: {type: string}
+                lat: {type: number}
+                lng: {type: number}
+                supply_chain_depth: {type: integer}
+                strategic_tier: {type: string}
+                risk_score: {type: number, nullable: true}
+                risk_category: {type: string, enum: [critical, high, medium, low], nullable: true}
+                active_disruption: {type: boolean}
+                spend_ytd: {type: number, nullable: true}
+          edges:
+            type: array
+            items:
+              type: object
+              properties:
+                rel_id: {type: string, format: uuid}
+                parent_id: {type: string, format: uuid}
+                child_id: {type: string, format: uuid}
+                relationship_type: {type: string}
+                is_single_source: {type: boolean}
+                material_flows: {type: array, items: {type: string}}
+                spend_pct: {type: number}
+          meta:
+            type: object
+            properties:
+              total_nodes: {type: integer}
+              single_source_count: {type: integer}
+              active_disruptions: {type: integer}
+      caching:
+        strategy: redis_cache
+        ttl_seconds: 60              # VIS updates every 60s; cache aligns
+        key_template: "scm:{tenant_id}:map:tier{tier}:{category_hash}"
+        invalidation: on_supplier_lifecycle_event
+
+    # -------------------------------------------------------------------------
+    # Shipment Tracking (VIS-FR-002)
+    # -------------------------------------------------------------------------
+    - method: GET
+      path: /shipments
+      query_params:
+        - name: status
+          type: array[string]
+        - name: supplier_id
+          type: uuid
+        - name: po_id
+          type: uuid
+        - name: transport_mode
+          type: string
+        - name: overdue_only
+          type: boolean
+        - name: page
+          type: integer
+          default: 1
+        - name: page_size
+          type: integer
+          default: 50
+          max: 200
+      response:
+        type: object
+        properties:
+          items: {type: array, items: {$ref: ShipmentSummary}}
+          total: {type: integer}
+          page: {type: integer}
+          page_size: {type: integer}
+      caching:
+        strategy: redis_cache
+        ttl_seconds: 30
+        key_template: "shipments:{tenant_id}:{filter_hash}"
+
+    - method: GET
+      path: /shipments/{shipment_id}
+      description: Full shipment detail including IoT telemetry history
+      response:
+        type: object
+        properties:
+          shipment: {$ref: ShipmentDetail}
+          po: {$ref: POSummary}
+          supplier: {$ref: SupplierSummary}
+          iot_telemetry_summary:
+            type: object
+            properties:
+              breach_count: {type: integer}
+              last_location: {type: object}
+              temperature_chart: {type: array}
+              humidity_chart: {type: array}
+
+    # -------------------------------------------------------------------------
+    # IoT Breach Events (VIS-FR-003)
+    # -------------------------------------------------------------------------
+    - method: GET
+      path: /shipments/{shipment_id}/iot-events
+      query_params:
+        - name: sensor_type
+          type: string
+        - name: breach_only
+          type: boolean
+          default: false
+        - name: from_time
+          type: string
+          format: date-time
+        - name: to_time
+          type: string
+          format: date-time
+      response:
+        type: array
+        items: {$ref: IoTTelemetryRecord}
+
+    # -------------------------------------------------------------------------
+    # Inventory (VIS-FR-004)
+    # -------------------------------------------------------------------------
+    - method: GET
+      path: /inventory
+      query_params:
+        - name: sku
+          type: string
+        - name: warehouse_id
+          type: string
+        - name: supplier_id
+          type: uuid
+        - name: low_stock_only
+          type: boolean
+        - name: days_of_supply_max
+          type: number
+      response:
+        type: array
+        items: {$ref: InventorySnapshot}
+      caching:
+        strategy: redis_cache
+        ttl_seconds: 120
+        key_template: "inv:{tenant_id}:{filter_hash}"
+
+    # -------------------------------------------------------------------------
+    # PO Lifecycle (VIS-FR-006)
+    # -------------------------------------------------------------------------
+    - method: GET
+      path: /purchase-orders
+      query_params:
+        - name: status
+          type: array[string]
+        - name: supplier_id
+          type: uuid
+        - name: overdue_only
+          type: boolean
+        - name: from_date
+          type: string
+          format: date
+        - name: to_date
+          type: string
+          format: date
+        - name: page
+          type: integer
+          default: 1
+        - name: page_size
+          type: integer
+          default: 50
+      response:
+        type: object
+        properties:
+          items: {type: array, items: {$ref: PurchasOrderSummary}}
+          total: {type: integer}
+
+    - method: GET
+      path: /purchase-orders/{po_id}
+      response:
+        type: object
+        properties:
+          po: {$ref: PurchaseOrderDetail}
+          line_items: {type: array, items: {$ref: POLineItem}}
+          shipments: {type: array, items: {$ref: ShipmentSummary}}
+          history: {type: array, items: {$ref: POStatusHistoryEntry}}
+
+    # -------------------------------------------------------------------------
+    # Supplier Capacity (VIS-FR-009)
+    # -------------------------------------------------------------------------
+    - method: GET
+      path: /suppliers/{supplier_id}/capacity
+      response:
+        type: object
+        properties:
+          supplier_id: {type: string, format: uuid}
+          production_capacity_pct: {type: number}
+          planned_downtime_periods: {type: array}
+          utilization_pct: {type: number}
+          capacity_at_risk: {type: boolean}
+          last_updated: {type: string, format: date-time}
+
+    # -------------------------------------------------------------------------
+    # Risk Event Overlay (VIS-FR-010)
+    # -------------------------------------------------------------------------
+    - method: GET
+      path: /event-overlay
+      query_params:
+        - name: event_types
+          type: array[string]
+          enum: [geopolitical, weather, natural_disaster, port_congestion]
+        - name: severity_min
+          type: string
+          enum: [low, medium, high, critical]
+        - name: from_time
+          type: string
+          format: date-time
+        - name: to_time
+          type: string
+          format: date-time
+        - name: bbox
+          type: string
+          description: "lat_min,lng_min,lat_max,lng_max bounding box"
+      response:
+        type: array
+        items:
+          type: object
+          properties:
+            event_id: {type: string, format: uuid}
+            event_type: {type: string}
+            severity: {type: string}
+            headline: {type: string}
+            affected_countries: {type: array}
+            affected_supplier_ids: {type: array}
+            geo_polygon: {type: object}
+            detected_at: {type: string, format: date-time}
+
+    # -------------------------------------------------------------------------
+    # Spend-at-Risk (VIS-FR-011)
+    # -------------------------------------------------------------------------
+    - method: GET
+      path: /spend-at-risk
+      query_params:
+        - name: risk_threshold
+          type: number
+          default: 70
+          description: "Minimum composite risk score to include"
+        - name: group_by
+          type: string
+          enum: [supplier, country, category]
+          default: supplier
+      response:
+        type: object
+        properties:
+          total_spend_at_risk_usd: {type: number}
+          groups:
+            type: array
+            items:
+              type: object
+              properties:
+                entity_id: {type: string}
+                entity_name: {type: string}
+                spend_at_risk_usd: {type: number}
+                avg_risk_score: {type: number}
+                active_disruptions: {type: integer}
+      caching:
+        strategy: redis_cache
+        ttl_seconds: 300
+        key_template: "sar:{tenant_id}:{threshold}:{group_by}"
+
+    # -------------------------------------------------------------------------
+    # Historical Playback (VIS-FR-012)
+    # -------------------------------------------------------------------------
+    - method: GET
+      path: /supply-chain-map/history
+      query_params:
+        - name: as_of
+          type: string
+          format: date-time
+          required: true
+        - name: supplier_ids
+          type: array[uuid]
+      description: >
+        Returns supply chain state reconstructed from event history at a given timestamp.
+        Reads from ClickHouse analytics store (not live PostgreSQL) to avoid OLTP impact.
+      response:
+        type: object
+        description: Same structure as /supply-chain-map but point-in-time
+
+# =============================================================================
+# 5. STATE MACHINE — PO Lifecycle
+# =============================================================================
+po_state_machine:
+  states:
+    - open
+    - confirmed
+    - partially_shipped
+    - shipped
+    - in_transit
+    - partially_received
+    - received
+    - cancelled
+    - disputed
+
+  transitions:
+    - from: open
+      to: confirmed
+      trigger: erp_event(po_confirmed)
+      emit: scvri.visibility.po_lifecycle_events
+
+    - from: open
+      to: cancelled
+      trigger: erp_event(po_cancelled)
+      emit: scvri.visibility.po_lifecycle_events
+
+    - from: confirmed
+      to: partially_shipped
+      trigger: erp_event(asn_received) WHERE qty < total_qty
+      emit: scvri.visibility.po_lifecycle_events
+
+    - from: confirmed
+      to: shipped
+      trigger: erp_event(asn_received) WHERE qty == total_qty
+      emit: scvri.visibility.po_lifecycle_events
+
+    - from: [partially_shipped, shipped]
+      to: in_transit
+      trigger: tms_event(shipment_departed)
+      emit: scvri.visibility.shipment_events
+
+    - from: in_transit
+      to: partially_received
+      trigger: erp_event(grn_created) WHERE qty < total_qty
+      emit: scvri.visibility.po_lifecycle_events
+
+    - from: [in_transit, partially_received]
+      to: received
+      trigger: erp_event(grn_created) WHERE qty == total_qty
+      emit: scvri.visibility.po_lifecycle_events
+
+  anomaly_triggers:
+    - condition: now() > required_delivery_at AND status IN (open, confirmed, in_transit)
+      action: emit(scvri.visibility.lead_time_deviation_events)
+      check_interval: 15min
+
+# =============================================================================
+# 6. SCALING MODEL
+# =============================================================================
+scaling:
+  hpa:
+    min_replicas: 3
+    max_replicas: 20
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 65
+      - type: External
+        external:
+          metric:
+            name: kafka_consumer_lag
+            selector:
+              matchLabels:
+                consumer_group: visibility-service
+          target:
+            type: AverageValue
+            averageValue: "5000"    # scale out when lag > 5000 per partition
+    scale_up_stabilization_window: 60s
+    scale_down_stabilization_window: 300s
+
+  resource_requests:
+    cpu: "500m"
+    memory: "1Gi"
+  resource_limits:
+    cpu: "2000m"
+    memory: "4Gi"
+
+  # IoT consumer is a separate deployment with different scaling
+  iot_consumer:
+    min_replicas: 4
+    max_replicas: 32
+    scale_metric: kafka_consumer_lag
+    scale_threshold: 20000
+
+# =============================================================================
+# 7. FAILURE MODES + RECOVERY
+# =============================================================================
+failure_modes:
+
+  - scenario: TMS API outage (carrier tracking unavailable)
+    impact: Shipments show stale location; no new status events
+    detection: circuit_breaker opens after 5 failures in 30s OR external health check fails
+    recovery:
+      - Circuit breaker enters OPEN state; stop calling failed provider
+      - Continue processing events from other carriers
+      - Display stale data indicator on shipments from affected carrier
+      - Emit alert: severity=medium, "Carrier API {name} unavailable"
+      - Retry probe every 60s; circuit breaker enters HALF_OPEN after 5 min
+      - On recovery: backfill missing events via batch reconciliation from carrier API
+
+  - scenario: Kafka lag > 100,000 (VIS consumer backlog)
+    impact: Shipment status updates delayed > threshold
+    detection: Prometheus alert on kafka_consumer_lag metric
+    recovery:
+      - HPA triggers pod scale-out (adds 4 replicas per scale step)
+      - Parallel consumer threads increase to max_parallelism
+      - Backpressure: pause non-critical IoT telemetry ingestion
+      - Alert ops team (P2 incident)
+
+  - scenario: PostgreSQL primary failure
+    impact: All write operations fail
+    detection: liveness probe fails; AWS RDS Multi-AZ monitors
+    recovery:
+      - AWS RDS automatic failover to standby (typically < 60s)
+      - Application reconnects via RDS proxy (connection pooling survives failover)
+      - Kafka consumer commits paused during failover; events replay on reconnect
+      - Alert: P1 incident triggered
+
+  - scenario: IoT breach event processing failure
+    impact: Cold chain alert may be missed
+    detection: DLQ message count > 0 on scvri.dlq.ingestion_errors
+    recovery:
+      - DLQ consumer retries with exponential backoff (max 3 attempts)
+      - After 3 failures: manual review queue + ops alert
+      - Shipment flagged with "IoT processing error" indicator in UI
+      - SLA: manual resolution within 30 min for temperature breaches
+
+# =============================================================================
+# 8. CACHING STRATEGY
+# =============================================================================
+caching:
+  technology: redis_cluster
+  key_patterns:
+    supply_chain_map:
+      key: "scm:{tenant_id}:map:tier{tier}:{filter_hash}"
+      ttl: 60s
+      invalidation:
+        - on: supplier.lifecycle_events (status_changed)
+          scope: all map keys for tenant
+        - on: risk.score_updated_events (if include_risk_scores=true)
+          scope: keys with risk overlay
+
+    shipment_list:
+      key: "shipments:{tenant_id}:{filter_hash}"
+      ttl: 30s
+      invalidation: on_shipment_status_changed
+
+    inventory:
+      key: "inv:{tenant_id}:{filter_hash}"
+      ttl: 120s                    # inventory less time-sensitive than shipments
+      invalidation: on_erp_inventory_sync
+
+    spend_at_risk:
+      key: "sar:{tenant_id}:{threshold}:{group_by}"
+      ttl: 300s
+      invalidation: on_risk_score_updated
+
+  warm_up:
+    strategy: pre_compute_on_login
+    triggers:
+      - user_login: preload top 10 suppliers for user's scope
+      - scheduled: 5min background refresh for active tenants
+
+# =============================================================================
+# 9. SECURITY CONTROLS
+# =============================================================================
+security:
+  authentication: JWT Bearer (validated by API Gateway / Kong)
+  authorization:
+    - resource: supply-chain-map
+      required_permissions: [visibility:read]
+    - resource: shipments
+      required_permissions: [visibility:read]
+    - resource: inventory
+      required_permissions: [visibility:read]
+    - resource: purchase-orders
+      required_permissions: [purchase_orders:read]
+
+  tenant_isolation:
+    - RLS policy enforced on all DB queries (SET app.current_tenant_id)
+    - Tenant ID extracted from JWT claims, not from request body/params
+    - User data scope applied (category/geography/supplier_segment filters)
+
+  pii_handling:
+    - Supplier contact emails masked in API responses unless role has pii:read
+    - All responses stripped of internal system IDs not needed by UI
+
+  rate_limiting:
+    default: 1000 req/min per tenant
+    burst_multiplier: 2
+    per_endpoint_overrides:
+      supply-chain-map: 200 req/min  # expensive graph query
+      history: 50 req/min            # expensive historical reconstruction
+
+  audit_logging:
+    - All GET /supply-chain-map calls logged (data access log)
+    - All /spend-at-risk exports logged
+    - action: "visibility.supply_chain_map.read"
+
+# =============================================================================
+# 10. OBSERVABILITY
+# =============================================================================
+observability:
+  metrics:
+    - name: visibility_shipments_tracked_total
+      type: counter
+      labels: [tenant_id, transport_mode, status]
+    - name: visibility_supply_chain_map_request_duration_seconds
+      type: histogram
+      buckets: [0.1, 0.5, 1.0, 2.0, 3.0, 5.0]
+      slo_target_p95: 3.0s           # NFR-PERF-001
+    - name: visibility_kafka_consumer_lag
+      type: gauge
+      labels: [consumer_group, topic, partition]
+    - name: visibility_iot_breach_events_total
+      type: counter
+      labels: [tenant_id, sensor_type]
+    - name: visibility_po_overdue_count
+      type: gauge
+      labels: [tenant_id]
+    - name: visibility_tms_api_error_rate
+      type: gauge
+      labels: [carrier_name, error_type]
+
+  logs:
+    format: json_structured
+    fields: [trace_id, span_id, tenant_id, request_id, user_id, action, duration_ms, status_code]
+    log_level_by_env:
+      production: info
+      staging: debug
+
+  traces:
+    provider: opentelemetry
+    jaeger_endpoint: "${JAEGER_COLLECTOR_ENDPOINT}"
+    sample_rate: 0.1               # 10% sampling (100% for errors)
+    propagation: w3c_trace_context
+
+  health_probes:
+    liveness: /health (checks DB connection, Kafka consumer alive)
+    readiness: /ready (checks DB connection, cache connection, Kafka consumer lag < 100k)
+
+# =============================================================================
+# 11. SRS TRACEABILITY
+# =============================================================================
+srs_traceability:
+  VIS-FR-001: GET /supply-chain-map (graph nodes+edges +tier depth)
+  VIS-FR-002: GET /shipments + Kafka tms_tracking consumer
+  VIS-FR-003: GET /shipments/{id}/iot-events + IoT breach events topic
+  VIS-FR-004: GET /inventory (days_of_supply computed column)
+  VIS-FR-005: lead_time_deviation_events topic + anomaly_triggers
+  VIS-FR-006: GET /purchase-orders + po_state_machine
+  VIS-FR-007: tms_tracking consumer handles multi-modal (transport_mode field)
+  VIS-FR-008: drill-down: GET /shipments/{id} + /purchase-orders/{id} + supply-chain-map?supplier_ids=
+  VIS-FR-009: GET /suppliers/{id}/capacity
+  VIS-FR-010: GET /event-overlay
+  VIS-FR-011: GET /spend-at-risk
+  VIS-FR-012: GET /supply-chain-map/history (ClickHouse reconstruction)
+  NFR-PERF-001: histogram metric, P95 target 3s; Redis cache with 60s TTL
+  NFR-PERF-002: simple queries cached; DB indexed by tenant_id+ status
+  NFR-PERF-006: Elasticsearch supplier lookup < 1s
+  NFR-SCAL-001: HPA min=3 max=20 on CPU + Kafka lag
+
+# =============================================================================
+# 12. GAP DETECTION & FIXES
+# =============================================================================
+gaps_detected:
+  - gap: VIS-FR-009 (capacity utilization) — no external data source defined in SRS
+    fix: Capacity data sourced from (a) ERP production orders, (b) supplier self-reported via portal,
+         (c) estimated from PO fill rate trends. Stored in supply.supplier_capacity table (added to schema).
+         Displayed with data source indicator and last-updated timestamp.
+
+  - gap: VIS-FR-012 (historical playback) — real-time DB unsuitable for point-in-time reconstruction
+    fix: Route historical queries to ClickHouse analytics store (populated by streaming ETL).
+         ClickHouse supports AS OF TIME queries via ReplacingMergeTree. Response may take up to 5s
+         (acceptable for historical analysis, not real-time); UI shows loading indicator.
+
+  - gap: Multi-tier graph traversal performance — PostgreSQL recursive CTE limited at scale
+    fix: Pre-compute supplier_relationships closure table (transitive closure) on write.
+         Cache full graph in Redis as adjacency list per tenant. Refresh on relationship change.
+         For tenants with >5,000 suppliers: async graph refresh with 60s staleness tolerance.

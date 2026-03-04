@@ -1,0 +1,158 @@
+version: 2
+
+updates:
+  # ── Python packages — shared library ────────────────────────────────────────
+  - package-ecosystem: pip
+    directory: /shared
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - python
+      - shared
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      python-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ── Python packages — per service ────────────────────────────────────────────
+  - package-ecosystem: pip
+    directory: /services/iam
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    labels: [dependencies, python, iam]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: pip
+    directory: /services/supplier-management
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, python, supplier-management]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: pip
+    directory: /services/risk-intelligence
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, python, risk-intelligence]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: pip
+    directory: /services/visibility
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, python, visibility]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: pip
+    directory: /services/alert-engine
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, python, alert-engine]
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: pip
+    directory: /services/integration
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, python, integration]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ── Docker base images ────────────────────────────────────────────────────────
+  - package-ecosystem: docker
+    directory: /services/iam
+    schedule:
+      interval: weekly
+      day: tuesday
+    labels: [dependencies, docker, iam]
+    commit-message:
+      prefix: "chore(docker)"
+
+  - package-ecosystem: docker
+    directory: /services/supplier-management
+    schedule:
+      interval: weekly
+      day: tuesday
+    labels: [dependencies, docker, supplier-management]
+    commit-message:
+      prefix: "chore(docker)"
+
+  - package-ecosystem: docker
+    directory: /services/risk-intelligence
+    schedule:
+      interval: weekly
+      day: tuesday
+    labels: [dependencies, docker, risk-intelligence]
+    commit-message:
+      prefix: "chore(docker)"
+
+  - package-ecosystem: docker
+    directory: /services/visibility
+    schedule:
+      interval: weekly
+      day: tuesday
+    labels: [dependencies, docker, visibility]
+    commit-message:
+      prefix: "chore(docker)"
+
+  - package-ecosystem: docker
+    directory: /services/alert-engine
+    schedule:
+      interval: weekly
+      day: tuesday
+    labels: [dependencies, docker, alert-engine]
+    commit-message:
+      prefix: "chore(docker)"
+
+  - package-ecosystem: docker
+    directory: /services/integration
+    schedule:
+      interval: weekly
+      day: tuesday
+    labels: [dependencies, docker, integration]
+    commit-message:
+      prefix: "chore(docker)"
+
+  # ── GitHub Actions ────────────────────────────────────────────────────────────
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    labels: [dependencies, github-actions]
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions:
+        patterns:
+          - "*"

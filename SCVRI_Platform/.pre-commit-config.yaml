@@ -1,0 +1,60 @@
+# .pre-commit-config.yaml
+# Install: make pre-commit-install
+# Run:     make pre-commit-run  (or runs automatically on git commit)
+
+default_language_version:
+  python: python3.12
+
+default_stages: [pre-commit]
+
+repos:
+  # ── Basic hygiene ────────────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: detect-private-key
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: no-commit-to-branch
+        args: [--branch, main]
+
+  # ── Python: ruff (lint + format) ─────────────────────────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.7
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        types_or: [python, pyi]
+      - id: ruff-format
+        types_or: [python, pyi]
+
+  # ── Secrets scanning ─────────────────────────────────────────────────────────
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+
+  # ── Kubernetes YAML validation ────────────────────────────────────────────────
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.28.4
+    hooks:
+      - id: check-github-workflows
+      - id: check-dependabot
+
+  # ── Dockerfile lint ───────────────────────────────────────────────────────────
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.12.0
+    hooks:
+      - id: hadolint-docker
+        args:
+          - --ignore=DL3008   # apt-get version pinning
+          - --ignore=DL3013   # pip version pinning

@@ -1,0 +1,106 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PodDisruptionBudgets — ensure minimum availability during voluntary disruptions
+# (node drains, cluster upgrades, etc.)
+# All HPAs have minReplicas=2, so PDB maxUnavailable=1 is safe.
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-iam
+  namespace: scvri
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: iam
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-supplier-management
+  namespace: scvri
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: supplier-management
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-risk-intelligence
+  namespace: scvri
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: risk-intelligence
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-visibility
+  namespace: scvri
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: visibility
+
+---
+# Alert Engine API — worker covered by separate PDB
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-alert-engine-api
+  namespace: scvri
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: alert-engine
+      component: api
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-alert-engine-worker
+  namespace: scvri
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: alert-engine
+      component: worker
+
+---
+# Integration API
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-integration-api
+  namespace: scvri
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: integration
+      component: api
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pdb-integration-worker
+  namespace: scvri
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: integration
+      component: worker

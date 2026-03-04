@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SCVRI Alert — {{ alert.severity | upper }}: {{ alert.title }}</title>
+  <style>
+    body { font-family: Arial, sans-serif; background-color: #f4f4f4; margin: 0; padding: 0; }
+    .wrapper { max-width: 640px; margin: 32px auto; background: #ffffff; border-radius: 6px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    .header  { padding: 20px 28px; color: #ffffff; }
+    .header.critical { background-color: #C0392B; }
+    .header.high     { background-color: #E67E22; }
+    .header.medium   { background-color: #F1C40F; color: #333; }
+    .header.low      { background-color: #27AE60; }
+    .header.info     { background-color: #2980B9; }
+    .header h1 { margin: 0; font-size: 20px; }
+    .header p  { margin: 4px 0 0; font-size: 13px; opacity: 0.85; }
+    .body      { padding: 24px 28px; }
+    .badge     { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; text-transform: uppercase; }
+    .badge-critical { background:#FADBD8; color:#C0392B; }
+    .badge-high     { background:#FDEBD0; color:#E67E22; }
+    .badge-medium   { background:#FEF9E7; color:#D4AC0D; }
+    .badge-low      { background:#D5F5E3; color:#1E8449; }
+    .badge-info     { background:#D6EAF8; color:#1A5276; }
+    table.meta { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }
+    table.meta td { padding: 8px 12px; border-bottom: 1px solid #eee; }
+    table.meta td:first-child { color: #888; width: 140px; }
+    .description { background: #f9f9f9; border-left: 4px solid #ccc; padding: 12px 16px; margin: 16px 0; font-size: 14px; line-height: 1.6; }
+    .footer { padding: 16px 28px; background: #f4f4f4; font-size: 12px; color: #aaa; text-align: center; }
+    a { color: #2980B9; }
+  </style>
+</head>
+<body>
+<div class="wrapper">
+
+  <div class="header {{ alert.severity }}">
+    <h1>{{ alert.title }}</h1>
+    <p>Alert Engine Notification &mdash; {{ cause | replace("_", " ") | title }}</p>
+  </div>
+
+  <div class="body">
+    <p>
+      <span class="badge badge-{{ alert.severity }}">{{ alert.severity }}</span>
+      &nbsp;
+      <strong>Status:</strong> {{ alert.status | title }}
+    </p>
+
+    <div class="description">{{ alert.description }}</div>
+
+    <table class="meta">
+      <tr><td>Alert ID</td><td><code>{{ alert.id }}</code></td></tr>
+      <tr><td>Source</td><td>{{ alert.source | replace("_", " ") | title }}</td></tr>
+      {% if alert.supplier_id %}
+      <tr><td>Supplier ID</td><td><code>{{ alert.supplier_id }}</code></td></tr>
+      {% endif %}
+      {% if alert.rule_id %}
+      <tr><td>Rule ID</td><td><code>{{ alert.rule_id }}</code></td></tr>
+      {% endif %}
+      <tr><td>Created</td><td>{{ alert.created_at.strftime("%Y-%m-%d %H:%M") if alert.created_at else "—" }} UTC</td></tr>
+      {% if alert.acknowledged_at %}
+      <tr><td>Acknowledged</td><td>{{ alert.acknowledged_at.strftime("%Y-%m-%d %H:%M") }} UTC</td></tr>
+      {% endif %}
+      {% if alert.escalated_at %}
+      <tr><td>Escalated</td><td>{{ alert.escalated_at.strftime("%Y-%m-%d %H:%M") }} UTC</td></tr>
+      {% endif %}
+      {% if alert.resolved_at %}
+      <tr><td>Resolved</td><td>{{ alert.resolved_at.strftime("%Y-%m-%d %H:%M") }} UTC</td></tr>
+      {% endif %}
+      {% if alert.assignee_id %}
+      <tr><td>Assigned To</td><td><code>{{ alert.assignee_id }}</code></td></tr>
+      {% endif %}
+    </table>
+
+    {% if alert_url %}
+    <p style="text-align:center; margin-top: 24px;">
+      <a href="{{ alert_url }}" style="background:#2980B9;color:#fff;padding:10px 24px;border-radius:4px;text-decoration:none;font-size:14px;">
+        View Alert in SCVRI
+      </a>
+    </p>
+    {% endif %}
+  </div>
+
+  <div class="footer">
+    This message was sent by the SCVRI Alert Engine. Do not reply to this email.<br/>
+    &copy; SCVRI Platform. All rights reserved.
+  </div>
+
+</div>
+</body>
+</html>

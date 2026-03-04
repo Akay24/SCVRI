@@ -1,0 +1,166 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# IAM Service — port 8000
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iam
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: iam
+    app.kubernetes.io/part-of: scvri-platform
+    app.kubernetes.io/version: "1.0.0"
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: iam
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: iam
+        app.kubernetes.io/part-of: scvri-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: scvri-iam
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: iam
+                topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: iam
+          image: ghcr.io/scvri/iam:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: scvri-common
+            - configMapRef:
+                name: scvri-iam-config
+            - secretRef:
+                name: scvri-postgres-secret
+            - secretRef:
+                name: scvri-redis-secret
+            - secretRef:
+                name: scvri-iam-keys
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 4
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iam
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: iam
+    app.kubernetes.io/part-of: scvri-platform
+spec:
+  selector:
+    app.kubernetes.io/name: iam
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: iam
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: iam
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: iam
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scvri-iam
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: iam
+    app.kubernetes.io/part-of: scvri-platform

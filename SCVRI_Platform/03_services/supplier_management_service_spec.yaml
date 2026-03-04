@@ -1,0 +1,728 @@
+##############################################################################
+# MODULE 6 — SUPPLIER MANAGEMENT SERVICE SPECIFICATION
+# SRS Coverage: SUP-FR-001..010, VIS-FR-001 (graph nodes), RISK-FR-013
+# Version: 1.0.0
+##############################################################################
+
+service:
+  name: supplier-management-service
+  language: Python 3.12
+  framework: FastAPI 0.111
+  port: 8005
+  k8s_namespace: scvri-prod
+
+# ------------------------------------------------------------------------------
+# 1. RESPONSIBILITIES
+# ------------------------------------------------------------------------------
+responsibilities:
+  - Supplier master data CRUD with fuzzy dedup (SUP-FR-001)
+  - Onboarding workflow engine with configurable questionnaire templates (SUP-FR-002)
+  - Document vault: S3-backed, version-controlled, expiry tracking (SUP-FR-003)
+  - Performance scorecard computation (OTD, defect, fill rate, invoice accuracy) (SUP-FR-004)
+  - Certification expiry notifications → emit events for Alert Engine (SUP-FR-005)
+  - Supplier self-service portal backend (SUP-FR-006)
+  - Diversity metrics tracking and reporting (SUP-FR-008)
+  - RFI and corrective action workflows (SUP-FR-009)
+  - 360-degree supplier profile assembly (SUP-FR-010)
+  - Multi-tier supply chain graph node management (VIS-FR-001)
+  - Alternate supplier candidate pool for Risk Intelligence Engine (RISK-FR-013)
+
+# ------------------------------------------------------------------------------
+# 2. DATABASE DEPENDENCIES (references core_domain_model.sql)
+# ------------------------------------------------------------------------------
+database_dependencies:
+  primary: supply.suppliers (Citus distributed, tenant_id shard key)
+  tables:
+    - supply.suppliers
+    - supply.supplier_relationships
+    - supply.supplier_documents
+    - supply.supplier_scorecards
+    - supply.purchase_orders           # read-only for scorecard inputs
+    - supply.po_line_items             # read-only for fill rate, defect rate
+    - supply.shipments                 # read-only for OTD computation
+    - audit.audit_log                  # write via audit trigger
+  read_replicas:
+    - PostgreSQL read replica for scorecard computation queries
+    - ClickHouse for historical scorecard trend queries
+
+# ------------------------------------------------------------------------------
+# 3. EVENT ARCHITECTURE
+# ------------------------------------------------------------------------------
+kafka_consumer_groups:
+  - group_id: supplier-mgmt-po-events
+    topics:
+      - supply_chain.purchase_orders.v1
+      - supply_chain.shipments.v1
+    purpose: Update scorecard metrics on PO/shipment state changes
+
+kafka_produced_events:
+  - topic: supply_chain.supplier_lifecycle.v1
+    events:
+      - SupplierCreated
+      - SupplierOnboardingCompleted
+      - SupplierStatusChanged
+      - SupplierRiskTierChanged
+      - SupplierDocumentUploaded
+      - SupplierDocumentExpiring          # triggers alert rule SYSTEM-002
+      - SupplierCertificationExpired
+      - SupplierScorecardComputed
+      - SupplierRFICreated
+      - CorrectiveActionRequested
+  - topic: risk_intelligence.score_triggers.v1
+    events:
+      - SupplierRelationshipAdded         # triggers re-score of tier-1 parent
+      - SupplierDataUpdated               # triggers scheduled re-score
+
+event_schemas:
+  SupplierCreated:
+    type: object
+    properties:
+      event_type: {const: SupplierCreated}
+      event_id: {type: string, format: uuid}
+      tenant_id: {type: string, format: uuid}
+      supplier_id: {type: string, format: uuid}
+      legal_name: {type: string}
+      country_code: {type: string}
+      procurement_category: {type: string}
+      created_by: {type: string, format: uuid}
+      occurred_at: {type: string, format: date-time}
+
+  SupplierDocumentExpiring:
+    type: object
+    properties:
+      event_type: {const: SupplierDocumentExpiring}
+      tenant_id: {type: string, format: uuid}
+      supplier_id: {type: string, format: uuid}
+      doc_id: {type: string, format: uuid}
+      doc_type: {type: string}
+      expiry_date: {type: string, format: date}
+      days_until_expiry: {type: integer}
+      occurred_at: {type: string, format: date-time}
+
+# ------------------------------------------------------------------------------
+# 4. REST API ENDPOINTS
+# ------------------------------------------------------------------------------
+api_endpoints:
+  base_path: /api/v1/suppliers
+
+  endpoints:
+    - method: GET
+      path: /
+      summary: "List suppliers with filtering, fuzzy search, pagination (SUP-FR-001)"
+      auth_required: true
+      min_role: viewer
+      query_params:
+        - name: search
+          type: string
+          description: "pg_trgm fuzzy match on legal_name + trade_name; minimum similarity 0.3"
+        - name: status
+          type: array[string]
+          enum: [pending_onboarding, under_review, active, suspended, offboarded, disqualified]
+        - name: strategic_tier
+          type: array[string]
+          enum: [strategic, preferred, approved, conditional, disqualified]
+        - name: procurement_category
+          type: string
+        - name: country_code
+          type: string
+        - name: transport_mode
+          type: string
+        - name: risk_level
+          type: string
+          enum: [critical, high, medium, low]
+        - name: diversity_flag
+          type: array[string]
+        - name: page
+          type: integer
+          default: 1
+        - name: page_size
+          type: integer
+          default: 50
+          max: 200
+      response_200:
+        items: SupplierSummary[]
+        total: integer
+        page: integer
+        has_next: boolean
+      sla: "<200ms P95 with Redis cache hit; <800ms P95 cache miss"
+      cache: "Redis, key=suppliers:{tenant_id}:{filter_hash}, ttl=60s"
+
+    - method: POST
+      path: /
+      summary: "Create supplier (SUP-FR-001)"
+      auth_required: true
+      min_role: procurement_officer
+      dedup_check:
+        strategy: "pg_trgm similarity >= 0.85 on (legal_name + country_code). Return potential_duplicate_ids if match found."
+        override_field: dedup_override_acknowledged
+      validation:
+        - legal_name: required, max 500 chars
+        - country_code: required, ISO 3166-1 alpha-2
+        - procurement_category: required, must exist in tenant category list
+        - duns_number: optional, regex ^\d{9}$ if provided
+      on_create:
+        - INSERT supply.suppliers with onboarding_status = pending_onboarding
+        - Emit SupplierCreated to supply_chain.supplier_lifecycle.v1
+        - If onboarding_template_id provided → start onboarding workflow
+      audit: supplier.create
+
+    - method: GET
+      path: /{supplier_id}
+      summary: "360-degree supplier profile (SUP-FR-010)"
+      auth_required: true
+      min_role: viewer
+      response_200:
+        supplier: SupplierDetail
+        risk_score: RiskScoreSummary          # from risk.supplier_risk_scores
+        latest_scorecard: SupplierScorecard    # from supply.supplier_scorecards
+        active_pos_count: integer
+        active_shipments_count: integer
+        open_certifications: Document[]
+        expiring_certifications: Document[]   # expiry within 90 days
+        active_incidents: RiskEvent[]
+        spend_ytd_usd: number
+        diversity_metrics: DiversityMetrics
+        corrective_actions_open: integer
+        tier_2_supplier_count: integer
+      cache: "Redis, ttl=120s"
+      sla: "<500ms P95"
+
+    - method: GET
+      path: /{supplier_id}/relationships
+      summary: "Multi-tier supply chain graph relationships (VIS-FR-001)"
+      query_params:
+        - name: depth
+          type: integer
+          default: 2
+          max: 3
+          description: "Traversal depth: 1=direct tier-2, 2=extends to tier-3, 3=full multi-tier"
+      algorithm:
+        description: |
+          Pre-computed transitive closure for tenants with > 5,000 suppliers.
+          Live recursive CTE for tenants with <= 5,000 suppliers.
+          Cache: Redis adjacency list per tenant, refreshed on SupplierRelationshipAdded event.
+        query: |
+          WITH RECURSIVE supplier_tree AS (
+            SELECT sr.child_supplier_id, sr.relationship_type, sr.material_flows,
+                   sr.spend_pct, 1 AS depth
+            FROM supply.supplier_relationships sr
+            WHERE sr.parent_supplier_id = :supplier_id
+              AND sr.tenant_id = current_setting('app.current_tenant_id')::uuid
+              AND sr.relationship_end_date IS NULL
+            UNION ALL
+            SELECT sr.child_supplier_id, sr.relationship_type, sr.material_flows,
+                   sr.spend_pct, t.depth + 1
+            FROM supply.supplier_relationships sr
+            JOIN supplier_tree t ON sr.parent_supplier_id = t.child_supplier_id
+            WHERE t.depth < :max_depth
+              AND sr.tenant_id = current_setting('app.current_tenant_id')::uuid
+          ) SELECT * FROM supplier_tree;
+      response_200:
+        nodes: SupplierNode[]
+        edges: RelationshipEdge[]
+        critical_path_flags: object
+      cache: "Redis, key=graph:{tenant_id}:{supplier_id}:{depth}, ttl=300s"
+
+    - method: POST
+      path: /{supplier_id}/relationships
+      summary: "Add supply chain relationship (VIS-FR-001)"
+      min_role: procurement_officer
+      body:
+        child_supplier_id: uuid (required)
+        relationship_type: string (required)
+        material_flows: array[string]
+        spend_pct: number (0-100)
+        is_single_source: boolean
+      on_create:
+        - INSERT supply.supplier_relationships
+        - Emit SupplierRelationshipAdded → triggers risk re-score for parent
+        - Invalidate graph cache for tenant
+
+    - method: GET
+      path: /{supplier_id}/scorecard
+      summary: "Performance scorecard by period (SUP-FR-004)"
+      query_params:
+        - name: periods
+          type: integer
+          default: 4
+          description: Number of rolling monthly/quarterly periods
+        - name: granularity
+          type: string
+          enum: [monthly, quarterly]
+          default: quarterly
+      computation:
+        otd_rate: |
+          SUM(CASE WHEN s.actual_delivery_date <= s.scheduled_delivery_date THEN 1 ELSE 0 END)::float
+          / NULLIF(COUNT(s.shipment_id), 0)
+          WHERE s.supplier_id = :supplier_id AND period_filter
+        defect_rate: |
+          SUM(pli.returned_qty)::float / NULLIF(SUM(pli.received_qty), 0)
+          WHERE pli related POs supplier_id = :supplier_id AND period_filter
+        fill_rate: |
+          SUM(pli.received_qty)::float / NULLIF(SUM(pli.ordered_qty), 0)
+        invoice_accuracy: |
+          100 - (COUNT(*) FILTER (WHERE invoice_discrepancy > 0) * 100.0 / COUNT(*))
+        overall_score: |
+          0.35 * otd_rate + 0.25 * fill_rate + 0.25 * (1 - defect_rate) + 0.15 * invoice_accuracy
+        grade_thresholds:
+          A: ">=90"
+          B: ">=75"
+          C: ">=60"
+          D: "<60"
+      response_200: SupplierScorecard[]
+      cache: "Redis, ttl=3600s (recomputed nightly by Celery)"
+
+    - method: GET
+      path: /{supplier_id}/documents
+      summary: "Document vault listing (SUP-FR-003)"
+      query_params:
+        - name: doc_type
+          type: string
+        - name: expiring_within_days
+          type: integer
+          description: "Return docs expiring within N days"
+        - name: include_expired
+          type: boolean
+          default: false
+      response_200: SupplierDocument[]
+
+    - method: POST
+      path: /{supplier_id}/documents
+      summary: "Upload document to S3-backed vault (SUP-FR-003)"
+      min_role: procurement_officer
+      content_type: multipart/form-data
+      max_file_size: "50MB"
+      allowed_types:
+        - application/pdf
+        - image/png
+        - image/jpeg
+        - application/vnd.openxmlformats-officedocument.wordprocessingml.document
+        - application/vnd.ms-excel
+      flow:
+        1: Validate MIME type + size
+        2: Generate S3 pre-signed PUT URL (s3://{tenant_bucket}/suppliers/{supplier_id}/docs/{doc_id}/v{n})
+        3: INSERT supply.supplier_documents with status=pending_upload
+        4: Return pre-signed URL to client; client uploads directly to S3
+        5: S3 event triggers Lambda → update document status=uploaded
+        6: Emit SupplierDocumentUploaded event
+      s3_config:
+        bucket_naming: "scvri-supplier-docs-{tenant_id}"
+        encryption: AES-256 (SSE-S3)
+        versioning: enabled
+        lifecycle:
+          - expired_docs → Glacier after 90 days
+          - active docs → Standard-IA after 365 days
+        object_lock:
+          mode: COMPLIANCE
+          retention_days: 2555  # 7 years for SOC2 audit trail
+      audit: supplier.document.upload
+
+    - method: GET
+      path: /{supplier_id}/diversity
+      summary: "Diversity metrics (SUP-FR-008)"
+      response_200:
+        supplier_id: uuid
+        diversity_flags: array[string]
+        certifying_body: string
+        certification_expiry: date
+        spend_usd_ytd: number
+        spend_pct_of_category: number
+        tier_1_diversity_pct: number    # % of tier-1 that are diverse suppliers
+      note: "diversity_flags values: wbe, mbe, lgbtbe, veteran_owned, disability_owned, hbcu"
+
+    - method: GET
+      path: /{supplier_id}/corrective-actions
+      summary: "Corrective action register (SUP-FR-009)"
+      response_200: CorrectiveAction[]
+
+    - method: POST
+      path: /{supplier_id}/corrective-actions
+      summary: "Raise corrective action (SUP-FR-009)"
+      min_role: procurement_officer
+      body:
+        issue_category: string (enum: quality|delivery|compliance|financial|esg|other)
+        severity: string (enum: critical|major|minor)
+        description: string (minLength: 50)
+        due_date: date
+        response_required_by: date
+        assigned_to_supplier_contact_email: string
+      on_create:
+        - INSERT corrective_actions (schema in core_domain_model)
+        - Email notification to supplier_contact_email
+        - Emit SupplierRFICreated event
+      allowed_statuses:
+        - open → acknowledged → in_remediation → verification_pending → closed
+        - open → rejected (with justification)
+
+    - method: POST
+      path: /{supplier_id}/rfi
+      summary: "RFI: Request For Information (SUP-FR-009)"
+      min_role: procurement_officer
+      body:
+        subject: string
+        questionnaire_id: uuid (optional — use template)
+        custom_questions: array[string] (optional)
+        due_date: date
+      response_202:
+        rfi_id: uuid
+        portal_link: url  # supplier portal one-time access link
+
+# ------------------------------------------------------------------------------
+# 5. ONBOARDING WORKFLOW ENGINE (SUP-FR-002)
+# ------------------------------------------------------------------------------
+onboarding_workflow:
+  description: "Configurable state machine for supplier onboarding. Each tenant can define templates."
+
+  status_states:
+    - pending_onboarding
+    - questionnaire_sent
+    - questionnaire_in_progress
+    - documents_requested
+    - under_review
+    - compliance_check
+    - approved
+    - rejected
+    - active
+
+  transitions:
+    - from: pending_onboarding
+      to: questionnaire_sent
+      trigger: send_questionnaire_action
+      actor: system | procurement_officer
+
+    - from: questionnaire_sent
+      to: questionnaire_in_progress
+      trigger: supplier_portal_first_access
+
+    - from: questionnaire_in_progress
+      to: documents_requested
+      trigger: questionnaire_submitted
+      actions:
+        - Validate required fields
+        - Auto-request missing documents from document_requirements list
+
+    - from: documents_requested
+      to: under_review
+      trigger: all_required_docs_uploaded
+      sla_days: 14
+
+    - from: under_review
+      to: compliance_check
+      trigger: internal_review_passed
+      actor: procurement_officer | supply_chain_manager
+      sla_days: 5
+
+    - from: compliance_check
+      to: approved
+      trigger: compliance_check_passed
+      actor: compliance_officer
+      actions:
+        - Set supplier.onboarding_status = active
+        - Set supplier.status = active
+        - Emit SupplierOnboardingCompleted
+
+    - from: compliance_check
+      to: rejected
+      trigger: compliance_check_failed
+      actor: compliance_officer
+      actions:
+        - Send rejection notification to supplier contact
+        - Log rejection reason in audit
+
+  questionnaire_templates:
+    default_fields:
+      - legal_entity_name (required)
+      - registered_address (required)
+      - duns_number (optional)
+      - vat_tax_id (required if EU)
+      - annual_revenue_usd (required)
+      - employee_count (required)
+      - primary_contact_name (required)
+      - primary_contact_email (required)
+      - banking_details_encrypted (required for payment setup)
+      - esg_policy_confirmation (required for strategic/preferred tier)
+      - data_processing_agreement_signed (required — GDPR)
+      - insurance_certs_level (required)
+    required_documents_by_tier:
+      strategic:
+        - certificate_of_incorporation
+        - latest_audited_financials_2yr
+        - iso_9001_or_equivalent
+        - esg_report
+        - cyber_security_assessment
+        - trade_references_3
+      preferred:
+        - certificate_of_incorporation
+        - latest_financial_statement
+        - quality_certification
+      approved:
+        - certificate_of_incorporation
+        - insurance_certificate
+      conditional:
+        - basic_company_registration
+
+  sla_escalation:
+    questionnaire_incomplete_after_7_days: send_reminder_email
+    questionnaire_incomplete_after_14_days: escalate_to_procurement_officer
+    documents_missing_after_sla_days: auto_reject_with_reopen_option
+
+# ------------------------------------------------------------------------------
+# 6. CERTIFICATION EXPIRY TRACKING (SUP-FR-005)
+# ------------------------------------------------------------------------------
+certification_expiry:
+  celery_beat_schedule:
+    task: check_expiring_certifications
+    cron: "0 7 * * *"   # Daily at 07:00 UTC
+    query: |
+      SELECT doc_id, supplier_id, tenant_id, doc_type, expiry_date,
+             expiry_date - CURRENT_DATE AS days_until_expiry
+      FROM supply.supplier_documents
+      WHERE expiry_date IS NOT NULL
+        AND status = 'active'
+        AND days_until_expiry IN (90, 60, 30, 14, 7, 0, -1)
+      ORDER BY tenant_id, supplier_id;
+    on_match:
+      - Emit SupplierDocumentExpiring event to supply_chain.supplier_lifecycle.v1
+      - Alert Engine SYSTEM-002 rule consumes this event and generates alerts
+      - At days_until_expiry = 0: also set expiry_alert_triggered = true in DB
+
+  alert_windows_days: [90, 60, 30, 14, 7, 0]
+  alert_severity_mapping:
+    90: low
+    60: medium
+    30: high
+    14: high
+    7: critical
+    0: critical
+    negative: critical  # already expired
+
+# ------------------------------------------------------------------------------
+# 7. ALTERNATE SUPPLIER POOL (RISK-FR-013)
+# ------------------------------------------------------------------------------
+alternate_supplier_pool:
+  description: |
+    Global alternate supplier index for risk mitigation recommendations.
+    PII stripped at registration to allow cross-tenant matching without data leakage.
+    Only ML_Lead role and Compliance role may access cross-tenant bias analysis.
+
+  pool_schema:
+    - global_supplier_id: uuid (deterministic, hashed from duns + country)
+    - country_code: string
+    - procurement_category: string
+    - approximate_capacity_tier: enum [small, medium, large, xlarge]
+    - certification_flags: array[string]
+    - strategic_capability_scores: jsonb (opaque ML embeddings)
+    - owns_tenant_id: uuid (masked in cross-tenant context)
+
+  matching_algorithm:
+    similarity_features:
+      - procurement_category match (mandatory filter)
+      - country_risk_delta (prefer lower risk countries)
+      - capacity_tier compatibility
+      - certification_overlap (e.g., same ISO standard)
+      - lead_time_similarity
+    output_fields_for_cross_tenant:
+      - global_supplier_id
+      - country_code
+      - procurement_category
+      - certifications
+      - capability_score
+      # Omitted: legal_name, contact info, financial details (PII stripped)
+
+  endpoint:
+    method: GET
+    path: /alternates
+    params:
+      category: string (required)
+      country_exclusions: array[string]
+      min_capacity_tier: string
+      required_certifications: array[string]
+      top_n: integer (default: 10, max: 50)
+    access_note: "Returns own-tenant alternates to all roles. Cross-tenant pool requires ML_Lead or Compliance role."
+
+# ------------------------------------------------------------------------------
+# 8. SCALING
+# ------------------------------------------------------------------------------
+scaling:
+  hpa:
+    min_replicas: 2
+    max_replicas: 10
+    scale_triggers:
+      - type: cpu
+        target_utilization: 70
+      - type: rabbitmq_lag    # Kafka consumer lag
+        target: 1000
+
+  celery_workers:
+    scorecard_computation:
+      concurrency: 8
+      queue: supplier_scorecards
+      schedule: nightly_2am_utc
+    certification_expiry_check:
+      concurrency: 4
+      queue: supplier_certs
+      schedule: daily_7am_utc
+
+  database_connection_pool:
+    primary_write: max_connections=20
+    read_replica: max_connections=40
+    statement_timeout: 30s
+    idle_in_transaction_session_timeout: 10s
+
+# ------------------------------------------------------------------------------
+# 9. CACHING STRATEGY
+# ------------------------------------------------------------------------------
+caching:
+  redis_cluster: "scvri-redis-prod (6 shards)"
+  key_patterns:
+    suppliers_list: "suppliers:{tenant_id}:{filter_hash}"
+    supplier_profile: "supplier:{tenant_id}:{supplier_id}"
+    supplier_graph: "graph:{tenant_id}:{supplier_id}:{depth}"
+    scorecard: "scorecard:{tenant_id}:{supplier_id}:{period}"
+    alternate_pool: "alternates:{tenant_id}:{category}:{filter_hash}"
+  ttls:
+    suppliers_list: 60s
+    supplier_profile: 120s
+    supplier_graph: 300s
+    scorecard: 3600s
+    alternate_pool: 1800s
+  invalidation_triggers:
+    - SupplierCreated → suppliers_list, supplier_graph
+    - SupplierStatusChanged → supplier_profile, suppliers_list
+    - SupplierRelationshipAdded → supplier_graph
+    - SupplierScorecardComputed → scorecard
+
+# ------------------------------------------------------------------------------
+# 10. SECURITY
+# ------------------------------------------------------------------------------
+security:
+  authentication: JWT (RS256, 15-min access token, 7-day refresh)
+  authorization: RBAC via core.user_roles + data scopes
+  tenant_isolation: RLS via current_setting('app.current_tenant_id')
+  document_access:
+    - S3 pre-signed URLs expire in 900s (15 minutes)
+    - Pre-signed URLs tied to user_id in CloudTrail
+    - No direct S3 bucket public access
+  supplier_portal_tokens:
+    - One-time use JWT, 48-hour TTL, scope limited to own-supplier data
+    - Token stored in Redis with revocation support
+  pii_fields:
+    - primary_contact_email (encrypted at rest, AES-256)
+    - primary_contact_phone (encrypted at rest)
+    - banking_details (encrypted column, separate KMS key)
+  audit_trail: All CUD operations emit to audit.audit_log via trigger
+
+# ------------------------------------------------------------------------------
+# 11. OBSERVABILITY
+# ------------------------------------------------------------------------------
+observability:
+  metrics:
+    - name: supplier_api_request_duration_seconds
+      labels: [method, endpoint, status_code, tenant_id]
+      sla_alert: "> 0.5s P95 for 5min"
+    - name: supplier_onboarding_workflow_duration_hours
+      alert: "> 168h (7 days) per stage = escalation"
+    - name: scorecard_computation_lag_hours
+      alert: "> 26h (expected: daily at 2am)"
+    - name: document_upload_failure_rate
+      alert: "> 5% over 15min"
+    - name: certification_expiry_events_emitted_total
+      labels: [tenant_id, days_window]
+
+  logging:
+    format: JSON
+    fields: [timestamp, level, trace_id, tenant_id, user_id, supplier_id, action, duration_ms]
+    pii_fields_masked: [contact_email, contact_phone]
+
+  tracing:
+    library: OpenTelemetry
+    provider: Jaeger
+    sampler: probabilistic(0.05)  # 5% sampling; 100% for errors
+
+# ------------------------------------------------------------------------------
+# 12. SRS TRACEABILITY
+# ------------------------------------------------------------------------------
+srs_traceability:
+  - srs_id: SUP-FR-001
+    description: "Centralized supplier registry"
+    implemented_by: "GET /suppliers, POST /suppliers, supplier master data CRUD"
+    test_ref: test_supplier_crud.py
+
+  - srs_id: SUP-FR-002
+    description: "Configurable onboarding workflow"
+    implemented_by: "Onboarding workflow engine, POST /suppliers, questionnaire_templates"
+    test_ref: test_onboarding_workflow.py
+
+  - srs_id: SUP-FR-003
+    description: "Document vault with version control and expiry"
+    implemented_by: "S3-backed document vault, GET/POST /{id}/documents"
+    test_ref: test_document_vault.py
+
+  - srs_id: SUP-FR-004
+    description: "Performance scorecards"
+    implemented_by: "GET /{id}/scorecard, scorecard computation in Celery"
+    test_ref: test_scorecard_computation.py
+
+  - srs_id: SUP-FR-005
+    description: "Certification expiry notifications"
+    implemented_by: "Celery Beat daily job, SupplierDocumentExpiring events, Alert Engine SYSTEM-002"
+    test_ref: test_cert_expiry.py
+
+  - srs_id: SUP-FR-006
+    description: "Supplier self-service portal backend"
+    implemented_by: "Supplier portal JWT tokens, POST /{id}/rfi, document upload flow"
+    test_ref: test_portal_access.py
+
+  - srs_id: SUP-FR-007
+    description: "Deduplication prevention"
+    implemented_by: "pg_trgm fuzzy match on POST /suppliers, dedup_override_acknowledged field"
+    test_ref: test_supplier_dedup.py
+
+  - srs_id: SUP-FR-008
+    description: "Diversity metrics"
+    implemented_by: "GET /{id}/diversity, diversity_flags column in supply.suppliers"
+    test_ref: test_diversity_metrics.py
+
+  - srs_id: SUP-FR-009
+    description: "RFI and corrective actions"
+    implemented_by: "POST /{id}/rfi, POST /{id}/corrective-actions, state machine"
+    test_ref: test_rfi_ca_workflow.py
+
+  - srs_id: SUP-FR-010
+    description: "360-degree supplier profile"
+    implemented_by: "GET /{id} assembles from suppliers + risk + scorecard + docs + incidents"
+    test_ref: test_360_profile.py
+
+  - srs_id: VIS-FR-001
+    description: "Multi-tier supply chain graph nodes"
+    implemented_by: "GET /{id}/relationships recursive CTE + transitive closure cache"
+    test_ref: test_supply_chain_graph.py
+
+  - srs_id: RISK-FR-013
+    description: "Alternate supplier pool"
+    implemented_by: "GET /alternates with PII-stripped cross-tenant pool"
+    test_ref: test_alternate_suppliers.py
+
+# ------------------------------------------------------------------------------
+# 13. GAPS DETECTED & FIXES APPLIED
+# ------------------------------------------------------------------------------
+gaps_and_fixes:
+  - gap_id: SUP-GAP-001
+    description: "SRS SUP-FR-002 specifies 'configurable templates' but does not define template data structure or workflow stages."
+    fix: "Defined explicit onboarding_status state machine with 9 states and transition triggers. Template engine stores required_fields + required_documents per tier as JSON. Allows tenant admins to customize via /admin/onboarding-templates endpoint."
+
+  - gap_id: SUP-GAP-002
+    description: "SRS does not address file size or type restrictions for document vault."
+    fix: "Enforced 50MB max per document, allowed MIME types: PDF, PNG, JPEG, DOCX, XLS. Virus scanning via ClamAV Lambda triggered on S3 PUT."
+
+  - gap_id: SUP-GAP-003
+    description: "SUP-FR-004 scorecard formulas not defined in SRS table."
+    fix: "Derived OTD, defect rate, fill rate, invoice accuracy formulas from SRS appendix and industry KPIs (SCOR model). Weighted composite formula documented. Formula version stored with each scorecard for reproducibility."
+
+  - gap_id: SUP-GAP-004
+    description: "SUP-FR-006 supplier portal isolation: SRS does not specify how supplier portal users are prevented from accessing other tenants' data."
+    fix: "Supplier portal JWTs are scoped to a single supplier_id. A dedicated RLS policy supplier_portal_isolation enforces that portal-role sessions can only read their own supplier_id rows."
+
+  - gap_id: SUP-GAP-005
+    description: "RISK-FR-013 alternate supplier cross-tenant exposure risk not addressed in SRS."
+    fix: "Global index stores only PII-stripped embeddings. legal_name, contact info, financial details excluded from cross-tenant context. ML_Lead + Compliance roles required for cross-tenant access. Full PII available to own-tenant users only."

@@ -1,0 +1,477 @@
+##############################################################################
+# MODULE 9 — ANALYTICS & REPORTING SERVICE + DATA WAREHOUSE SPECIFICATION
+# SRS Coverage: RPT-FR-001..008, NFR-PERF-003 (dashboard < 3s P95)
+# Version: 1.0.0
+##############################################################################
+
+analytics_service:
+  name: analytics-reporting-service
+  language: Python 3.12
+  framework: FastAPI 0.111
+  port: 8007
+  k8s_namespace: scvri-prod
+
+# ------------------------------------------------------------------------------
+# 1. DATA WAREHOUSE ARCHITECTURE
+# ------------------------------------------------------------------------------
+data_warehouse:
+  primary_olap: ClickHouse
+  secondary_dw: Snowflake (optional enterprise tier; tenant self-provision)
+  etl_tool: dbt 1.8 (models defined in 04_data_architecture/dbt/)
+  streaming_etl: Kafka Connect → ClickHouse sink (real-time KRI tables)
+
+  clickhouse_cluster:
+    version: "24.3 LTS"
+    deployment: EKS (ClickHouse Operator)
+    shards: 4
+    replicas_per_shard: 2
+    total_nodes: 8
+    storage_per_node: 2TB NVMe SSD (gp3)
+    compression: LZ4 for hot data, ZSTD for cold
+    distributed_table_engine: ReplicatedMergeTree
+
+  schemas:
+    analytics_db:
+      tables:
+        - name: fact_risk_scores
+          engine: ReplicatedMergeTree(month)
+          order_by: [tenant_id, supplier_id, scored_at]
+          partition_by: toYYYYMM(scored_at)
+          columns:
+            tenant_id: UUID
+            supplier_id: UUID
+            composite_score: Float32
+            financial_score: Float32
+            operational_score: Float32
+            geopolitical_score: Float32
+            esg_score: Float32
+            concentration_score: Float32
+            cyber_score: Float32
+            natural_hazard_score: Float32
+            risk_level: LowCardinality(String)
+            model_version: String
+            scored_at: DateTime64(3)
+
+        - name: fact_shipments
+          engine: ReplicatedMergeTree()
+          order_by: [tenant_id, shipment_id, status_changed_at]
+          partition_by: toYYYYMM(status_changed_at)
+          columns:
+            tenant_id: UUID
+            shipment_id: UUID
+            supplier_id: UUID
+            po_id: UUID
+            transport_mode: LowCardinality(String)
+            status: LowCardinality(String)
+            origin_country: LowCardinality(String)
+            dest_country: LowCardinality(String)
+            eta_deviation_hours: Float32
+            is_overdue: UInt8
+            status_changed_at: DateTime64(3)
+            carrier_name: String
+
+        - name: fact_purchase_orders
+          engine: ReplicatedMergeTree()
+          order_by: [tenant_id, po_id, event_time]
+          columns:
+            tenant_id: UUID
+            po_id: UUID
+            supplier_id: UUID
+            po_status: LowCardinality(String)
+            currency: LowCardinality(String)
+            total_value: Float64
+            event_time: DateTime64(3)
+
+        - name: fact_alerts
+          engine: ReplicatedMergeTree()
+          order_by: [tenant_id, alert_id, generated_at]
+          partition_by: toYYYYMM(generated_at)
+          columns:
+            tenant_id: UUID
+            alert_id: UUID
+            severity: LowCardinality(String)
+            entity_type: LowCardinality(String)
+            entity_id: UUID
+            rule_id: UUID
+            rule_name: String
+            status: LowCardinality(String)
+            generated_at: DateTime64(3)
+            acknowledged_at: DateTime64(3) NULLABLE
+            resolved_at: DateTime64(3) NULLABLE
+            delivery_latency_ms: UInt32 NULLABLE
+
+        - name: fact_kri_snapshots
+          engine: ReplicatedMergeTree()
+          order_by: [tenant_id, kri_name, snapshot_date]
+          partition_by: toYYYYQQ(snapshot_date)
+          columns:
+            tenant_id: UUID
+            kri_name: String
+            kri_category: LowCardinality(String)
+            kri_value: Float64
+            dimension: LowCardinality(String)
+            snapshot_date: Date
+
+        - name: dim_suppliers
+          engine: ReplicatedReplacingMergeTree(updated_at)
+          order_by: [tenant_id, supplier_id]
+          columns:
+            tenant_id: UUID
+            supplier_id: UUID
+            legal_name: String
+            country_code: LowCardinality(String)
+            strategic_tier: LowCardinality(String)
+            procurement_category: LowCardinality(String)
+            spend_tier: LowCardinality(String)
+            is_active: UInt8
+            updated_at: DateTime64(3)
+
+  materialized_views:
+    - name: mv_supplier_risk_trend_30d
+      description: "Rolling 30-day risk score trend per supplier"
+      query: |
+        SELECT tenant_id, supplier_id,
+               avg(composite_score) AS avg_score_30d,
+               max(composite_score) AS max_score_30d,
+               min(composite_score) AS min_score_30d,
+               last_value(composite_score) AS current_score,
+               countIf(risk_level = 'critical') AS critical_days_30d
+        FROM fact_risk_scores
+        WHERE scored_at >= now() - INTERVAL 30 DAY
+        GROUP BY tenant_id, supplier_id
+
+    - name: mv_delivery_performance_monthly
+      description: "On-time delivery rates by supplier and month"
+      query: |
+        SELECT tenant_id, supplier_id,
+               toYYYYMM(status_changed_at) AS month,
+               countIf(is_overdue = 0) / count() AS otd_rate,
+               avg(eta_deviation_hours) AS avg_deviation_hours,
+               count() AS total_shipments
+        FROM fact_shipments
+        WHERE status = 'delivered'
+        GROUP BY tenant_id, supplier_id, month
+
+    - name: mv_spend_at_risk_by_category
+      description: "Spend at risk by procurement category (risk_score >= 70)"
+      query: |
+        SELECT s.tenant_id, s.procurement_category,
+               sum(po.total_value) AS spend_at_risk_usd,
+               count(DISTINCT s.supplier_id) AS high_risk_suppliers
+        FROM dim_suppliers s
+        JOIN fact_purchase_orders po ON s.supplier_id = po.supplier_id
+        JOIN fact_risk_scores rs ON s.supplier_id = rs.supplier_id
+        WHERE rs.composite_score >= 70
+          AND rs.scored_at = (SELECT max(scored_at) FROM fact_risk_scores r2 WHERE r2.supplier_id = s.supplier_id)
+          AND po.po_status = 'open'
+        GROUP BY s.tenant_id, s.procurement_category
+
+    - name: mv_alert_sla_compliance
+      description: "Alert delivery latency SLA compliance"
+      query: |
+        SELECT tenant_id,
+               toYYYYMMDD(generated_at) AS date,
+               severity,
+               countIf(delivery_latency_ms <= 300000) / count() AS sla_compliance_rate,
+               quantile(0.95)(delivery_latency_ms) AS p95_latency_ms
+        FROM fact_alerts
+        GROUP BY tenant_id, date, severity
+
+# ------------------------------------------------------------------------------
+# 2. REPORT CATALOG (RPT-FR-002)
+# ------------------------------------------------------------------------------
+report_catalog:
+  total_reports: 20
+
+  categories:
+    risk_reports:
+      - report_id: RPT-001
+        name: "Executive Risk Dashboard Summary"
+        description: "Top-line risk KPIs: critical suppliers, spend at risk, score distribution, YoY trend"
+        format: [pdf, png]
+        frequency: [daily, weekly, monthly]
+        data_source: ClickHouse mv_supplier_risk_trend_30d + fact_kri_snapshots
+        params: [date_range, risk_tier_filter]
+        sla: "<5s generation"
+
+      - report_id: RPT-002
+        name: "Supplier Risk Heatmap Report"
+        description: "Geographic heatmap of supplier risk scores by country/region"
+        format: [pdf, png]
+        data_source: ClickHouse fact_risk_scores + dim_suppliers
+        sla: "<8s"
+
+      - report_id: RPT-003
+        name: "Risk Score Change Report"
+        description: "Suppliers with largest risk score changes in period (delta >= 5)"
+        format: [xlsx, pdf]
+        params: [date_range, delta_threshold]
+        sla: "<5s"
+
+      - report_id: RPT-004
+        name: "Concentration Risk Report (RISK-FR-006)"
+        description: "Single-source suppliers, spend concentration by category/country"
+        format: [pdf, xlsx]
+        data_source: supply.supplier_relationships + fact_purchase_orders
+        sla: "<10s"
+
+      - report_id: RPT-005
+        name: "Geopolitical Risk Exposure"
+        description: "Supplier exposure by conflict/sanction-listed regions"
+        format: [pdf]
+        data_source: fact_risk_scores, external intelligence feed
+        sla: "<10s"
+
+    operations_reports:
+      - report_id: RPT-006
+        name: "On-Time Delivery Performance"
+        description: "OTD rates by supplier, carrier, lane, and period"
+        format: [xlsx, pdf]
+        data_source: mv_delivery_performance_monthly
+        sla: "<5s"
+
+      - report_id: RPT-007
+        name: "Shipment Delay Analysis"
+        description: "Average delay hours by transport mode, carrier, and origin"
+        format: [xlsx, pdf]
+        data_source: fact_shipments
+        sla: "<8s"
+
+      - report_id: RPT-008
+        name: "Inventory Days of Supply"
+        description: "Current inventory coverage vs. reorder triggers"
+        format: [xlsx, pdf]
+        data_source: supply.inventory_snapshots (PostgreSQL direct query)
+        sla: "<5s"
+
+      - report_id: RPT-009
+        name: "Purchase Order Cycle Time"
+        description: "Average time from PO creation to goods receipt by supplier/category"
+        format: [xlsx]
+        data_source: fact_purchase_orders
+        sla: "<8s"
+
+    supplier_reports:
+      - report_id: RPT-010
+        name: "Supplier Performance Scorecard Report"
+        description: "Full scorecard KPIs for all active suppliers in period"
+        format: [xlsx, pdf]
+        data_source: supply.supplier_scorecards (PostgreSQL)
+        sla: "<15s"
+
+      - report_id: RPT-011
+        name: "Supplier Onboarding Pipeline"
+        description: "Active onboarding status, time-in-stage, SLA breach risks"
+        format: [pdf, xlsx]
+        data_source: supply.suppliers (PostgreSQL)
+        sla: "<5s"
+
+      - report_id: RPT-012
+        name: "Document Expiry Report"
+        description: "All certifications expiring in 0-90 days"
+        format: [xlsx, pdf]
+        data_source: supply.supplier_documents (PostgreSQL)
+        sla: "<5s"
+
+      - report_id: RPT-013
+        name: "Supplier Diversity Report (SUP-FR-008)"
+        description: "Spend by diversity classification (WBE/MBE/LGBTBE/veteran)"
+        format: [xlsx, pdf]
+        data_source: supply.suppliers + fact_purchase_orders
+        sla: "<8s"
+
+    compliance_reports:
+      - report_id: RPT-014
+        name: "SOC 2 Audit Evidence Report"
+        description: "Access control changes, MFA compliance, failed login events for audit period"
+        format: [pdf]
+        data_source: audit.audit_log (PostgreSQL encrypted export)
+        min_role: compliance_officer
+        sla: "<30s (large date ranges)"
+
+      - report_id: RPT-015
+        name: "GDPR Erasure Request Status"
+        description: "All erasure requests, SLA deadlines, completion status"
+        format: [pdf, xlsx]
+        data_source: gdpr.erasure_requests (PostgreSQL)
+        min_role: compliance_officer
+        sla: "<5s"
+
+      - report_id: RPT-016
+        name: "Data Access Audit Report"
+        description: "Who accessed what data in period — for external audit"
+        format: [pdf]
+        data_source: audit.audit_log (PostgreSQL)
+        min_role: compliance_officer
+        sla: "<30s"
+
+    alert_reports:
+      - report_id: RPT-017
+        name: "Alert Inbox Summary"
+        description: "Alert volume, severity distribution, resolution times, SLA compliance"
+        format: [pdf, xlsx]
+        data_source: mv_alert_sla_compliance + fact_alerts
+        sla: "<5s"
+
+      - report_id: RPT-018
+        name: "Mean Time to Resolve (MTTR) Report"
+        description: "MTTR by severity, team, and alert type"
+        format: [xlsx]
+        data_source: fact_alerts
+        sla: "<5s"
+
+    financial_reports:
+      - report_id: RPT-019
+        name: "Spend at Risk Report"
+        description: "Open PO spend for suppliers with risk_score >= threshold"
+        format: [xlsx, pdf]
+        data_source: mv_spend_at_risk_by_category
+        sla: "<8s"
+
+      - report_id: RPT-020
+        name: "30/60/90 Day Risk Forecast"
+        description: "Predicted risk trajectory per supplier from ML forecasting model"
+        format: [pdf, xlsx]
+        data_source: risk.supplier_risk_scores.predictions (PostgreSQL JSON)
+        sla: "<10s"
+
+# ------------------------------------------------------------------------------
+# 3. REPORT GENERATION ENGINE
+# ------------------------------------------------------------------------------
+report_engine:
+  technology: Python + Celery workers
+  rendering:
+    pdf: WeasyPrint (HTML → PDF, CSS Paged Media)
+    xlsx: openpyxl
+    png: matplotlib + seaborn (chart rendering)
+
+  pipeline:
+    step_1_validate: Validate report_id + params + permission
+    step_2_query: Execute parameterized query against ClickHouse / PostgreSQL
+    step_3_aggregate: Apply dbt ref() or Python transforms
+    step_4_render: Generate output file using appropriate renderer
+    step_5_store: Upload to s3://scvri-report-output-{tenant_id}/{job_id}/{filename}
+    step_6_notify: PUT signed S3 URL (900s TTL) in job record; send email if scheduled
+
+  celery_worker:
+    queue: report_generation
+    concurrency: 4 workers (up to 12 for enterprise tier)
+    priority_queue: true (on-demand > scheduled)
+    result_ttl: 24h (signed URL valid 15min; raw file kept 24h then auto-deleted)
+
+  caching:
+    same_params_ttl: 3600s (cached JSON result → re-render without re-querying)
+    key: "report:{tenant_id}:{report_id}:{params_hash}"
+
+# ------------------------------------------------------------------------------
+# 4. AD-HOC QUERY BUILDER (RPT-FR-006)
+# ------------------------------------------------------------------------------
+ad_hoc_query_builder:
+  description: "No-code query builder exposed via UI → generates SQL, executes against ClickHouse"
+  available_tables:
+    - fact_risk_scores (fields: supplier_id, composite_score, risk_level, scored_at, dimension_scores)
+    - fact_shipments (fields: supplier_id, transport_mode, is_overdue, eta_deviation_hours)
+    - fact_purchase_orders (fields: supplier_id, po_status, total_value, currency)
+    - fact_alerts (fields: severity, rule_name, delivery_latency_ms, generated_at)
+    - dim_suppliers (fields: legal_name, country_code, strategic_tier, procurement_category)
+
+  supported_operations:
+    - filter (=, !=, >, <, >=, <=, IN, NOT IN, LIKE, IS NULL)
+    - group_by
+    - aggregate (COUNT, SUM, AVG, MIN, MAX, P95, P99)
+    - date_trunc (day, week, month, quarter)
+    - sort_by + limit (max 50,000 rows)
+
+  security_controls:
+    - Generated SQL is parameterized (no SQL injection vector)
+    - Auto-injects AND tenant_id = {jwt.tenant_id} to every query
+    - Max query execution time: 30s (ClickHouse max_execution_time setting)
+    - Result size cap: 50,000 rows or 10MB, whichever is smaller
+    - Export requires analytics role (read + export permission)
+    - Queries logged to audit.audit_log with SQL fingerprint (not full SQL)
+
+# ------------------------------------------------------------------------------
+# 5. SCHEDULED REPORT DELIVERY (RPT-FR-004)
+# ------------------------------------------------------------------------------
+scheduled_reports:
+  storage: analytics.report_schedules (PostgreSQL)
+  scheduler: Celery Beat (CRON-based)
+  delivery:
+    email: AWS SES (PDF/XLSX attachment up to 10MB; link if larger)
+    sftp: optional secure file transfer for enterprise tier
+    webhook: optional webhook delivery of download URL
+
+  schedule_examples:
+    - frequency: daily
+      cron: "0 6 * * *"   # 6 AM UTC
+      report_id: RPT-017
+      description: "Daily alert summary to supply chain team"
+    - frequency: weekly
+      cron: "0 7 * * 1"   # Monday 7 AM UTC
+      report_id: RPT-001
+      description: "Weekly executive risk dashboard"
+    - frequency: monthly
+      cron: "0 8 1 * *"   # 1st of month, 8 AM UTC
+      report_id: RPT-010
+      description: "Monthly supplier scorecard report"
+
+# ------------------------------------------------------------------------------
+# 6. DASHBOARD KPIs (RPT-FR-001)
+# ------------------------------------------------------------------------------
+dashboard_kpis:
+  executive_dashboard:
+    widgets:
+      - type: metric_card
+        name: "Suppliers at Critical Risk"
+        query: "SELECT count(*) FROM latest_risk_scores WHERE risk_level = 'critical'"
+        refresh_seconds: 300
+      - type: metric_card
+        name: "Total Spend at Risk"
+        query: "SELECT sum(spend_at_risk_usd) FROM mv_spend_at_risk_by_category"
+        refresh_seconds: 300
+      - type: time_series
+        name: "Risk Score Distribution Trend (90 days)"
+        data_source: mv_supplier_risk_trend_30d
+        refresh_seconds: 3600
+      - type: heatmap
+        name: "Supplier Risk Heatmap by Country"
+        data_source: fact_risk_scores + dim_suppliers
+        refresh_seconds: 3600
+      - type: table
+        name: "Top 10 Highest Risk Suppliers"
+        query: "SELECT supplier_id, legal_name, composite_score, risk_level FROM latest_risk_scores ORDER BY composite_score DESC LIMIT 10"
+        refresh_seconds: 300
+      - type: gauge
+        name: "OTD Rate (Current Month)"
+        data_source: mv_delivery_performance_monthly
+        refresh_seconds: 3600
+      - type: distribution
+        name: "Alert Volume by Severity (7 days)"
+        data_source: fact_alerts
+        refresh_seconds: 300
+      - type: metric_card
+        name: "Open Corrective Actions"
+        query: "SELECT count(*) FROM corrective_actions WHERE status NOT IN ('closed', 'rejected')"
+        refresh_seconds: 600
+
+  dashboard_sla:
+    target: "< 3s P95 initial load"
+    strategy:
+      - All KPI queries against ClickHouse (columnar, sub-100ms for aggregation on 10M rows)
+      - Redis cache for repeated dashboard loads: ttl=60s key="dashboard:{tenant_id}:{user_id}:{hash}"
+      - Stale-while-revalidate: serve cached data immediately + trigger background refresh
+      - Materialized views pre-computed for complex aggregations (mv_* tables above)
+
+# ------------------------------------------------------------------------------
+# 7. SRS TRACEABILITY
+# ------------------------------------------------------------------------------
+srs_traceability:
+  - {srs_id: RPT-FR-001, implemented_by: "Executive dashboard KPI widgets, ClickHouse queries"}
+  - {srs_id: RPT-FR-002, implemented_by: "20 report catalog entries, report_engine pipeline"}
+  - {srs_id: RPT-FR-003, implemented_by: "PDF/XLSX/PNG/CSV rendering via WeasyPrint + openpyxl"}
+  - {srs_id: RPT-FR-004, implemented_by: "Scheduled reports via Celery Beat + AWS SES delivery"}
+  - {srs_id: RPT-FR-005, implemented_by: "ClickHouse data warehouse, dbt ETL models, Kafka Connect streaming"}
+  - {srs_id: RPT-FR-006, implemented_by: "Ad-hoc query builder with tenant-scoped parameterized SQL"}
+  - {srs_id: RPT-FR-007, implemented_by: "Report generation endpoint POST /reports/{id}/generate (async + job polling)"}
+  - {srs_id: RPT-FR-008, implemented_by: "Report access control via RBAC (min_role enforcement + data scoping)"}
+  - {srs_id: NFR-PERF-003, implemented_by: "ClickHouse MV + Redis stale-while-revalidate → < 3s P95 dashboard"}

@@ -1,0 +1,111 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PostgreSQL 16 — single-node StatefulSet (upgrade to primary/replica for HA)
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgresql-data
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/part-of: scvri-platform
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: fast-ssd
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/part-of: scvri-platform
+spec:
+  clusterIP: None   # headless — needed for StatefulSet stable DNS
+  selector:
+    app.kubernetes.io/name: postgresql
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/part-of: scvri-platform
+    app.kubernetes.io/version: "16"
+spec:
+  serviceName: postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgresql
+        app.kubernetes.io/part-of: scvri-platform
+    spec:
+      securityContext:
+        fsGroup: 999
+        runAsUser: 999
+        runAsNonRoot: true
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgresql
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_DB
+              value: scvri
+            - name: POSTGRES_USER
+              value: scvri_app
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: scvri-postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "scvri_app", "-d", "scvri"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "scvri_app", "-d", "scvri"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: postgresql-data
+          persistentVolumeClaim:
+            claimName: postgresql-data
+        - name: init-scripts
+          configMap:
+            name: scvri-db-init
+            optional: true

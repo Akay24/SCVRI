@@ -1,0 +1,342 @@
+##############################################################################
+# MODULE 14 — COMPLIANCE CONTROLS
+# GDPR, CCPA, SOC 2 Type II, ISO 27001
+# Version: 1.0.0
+##############################################################################
+
+compliance_framework:
+  regulations: [GDPR, CCPA, SOC 2 Type II, ISO 27001:2022]
+  primary_dpa_region: EU (GDPR as strictest baseline)
+  last_reviewed: 2024-10-01
+  review_cycle: annual + on material system change
+
+# ==============================================================================
+# GDPR COMPLIANCE CONTROLS
+# ==============================================================================
+gdpr:
+  data_controller_role: "SCVRI customer (tenant) is primary data controller for supplier personal data they upload"
+  data_processor_role: "SCVRI Platform is data processor — processes personal data on behalf of tenant"
+  dpa_required: true   # Data Processing Agreement with every tenant
+  sub_processors:
+    - AWS (hosting, RDS, MSK, S3)
+    - SendGrid (email delivery)
+    - Twilio (SMS delivery)
+    - Refinitiv (external data)
+    - D&B (external data)
+
+  lawful_basis_per_purpose:
+    - purpose: "Supplier onboarding contact data"
+      lawful_basis: "Legitimate Interest (contract performance with supplier)"
+      retention: "Duration of supplier relationship + 7 years"
+    - purpose: "Audit logs with user personal data"
+      lawful_basis: "Legal obligation (SOC 2 + ISO 27001)"
+      retention: "7 years (immutable)"
+    - purpose: "User profile (name, email)"
+      lawful_basis: "Contract (employment / service agreement)"
+      retention: "Duration of employment/contract + 2 years"
+
+  # ---
+  # ARTICLE 17 — RIGHT TO ERASURE (NFR-COMP-001)
+  # ---
+  right_to_erasure:
+    sla: 30 calendar days
+    request_entry_points:
+      - POST /api/v1/compliance/erasure-requests (authenticated)
+      - Data protection email: dpo@scvri.io (acknowledged within 3 days → linked to request)
+    identity_verification:
+      - Email OTP confirmation to requester_email
+      - Tenant admin must also confirm for employee/user erasure (prevents malicious external requests)
+
+    erasure_workflow:
+      step_1_receive:
+        action: "INSERT gdpr.erasure_requests with sla_deadline = request_date + 30 days"
+        automated_ack: "Send confirmation email with request_id + deadline"
+
+      step_2_scope_determination:
+        action: |
+          Query all tables for rows containing requester PII:
+            - core.users (email match)
+            - supply.suppliers (primary_contact_email match)
+            - alert.alert_deliveries (recipient_email match)
+            - audit.audit_log (actor_email — special treatment, see step 5)
+        automated: true (scoped by tenant_id + requester_email)
+
+      step_3_soft_delete:
+        action: |
+          For core.users:
+            UPDATE core.users SET
+              email = 'erased_{user_id}@erased.invalid',
+              display_name = '[Erased]',
+              status = 'erased',
+              gdpr_erasure_request_id = :request_id
+            WHERE user_id = :user_id AND tenant_id = :tenant_id;
+          For supply.suppliers (contact fields):
+            UPDATE supply.suppliers SET
+              primary_contact_name = '[Erased]',
+              primary_contact_email = 'erased_{supplier_id}@erased.invalid',
+              primary_contact_phone = NULL,
+              gdpr_erased_at = NOW()
+            WHERE supplier_id = :supplier_id;
+        sla: within 24h of request receipt (auto-executed)
+
+      step_4_cascade_delete:
+        action: |
+          - Delete Redis sessions for user
+          - Revoke all JWTs (add jti to revocation list)
+          - Delete S3 objects: supplier documents (s3://scvri-supplier-docs-{tenant_id}/suppliers/{supplier_id}/)
+          - Delete ClickHouse rows for supplier_id (analytics data with PII embeddings)
+          - S3 Glacier archive: mark for delayed deletion (legal hold check first)
+        sla: within 7 days of soft delete
+
+      step_5_audit_log_pseudonymisation:
+        description: |
+          Audit log cannot be deleted (legal obligation — SOC 2, immutability trigger).
+          Instead: pseudonymise actor_email in audit log.
+          Replace with 'ERASED_USER_{hash(original_email + salt)}'
+          This satisfies GDPR Recital 26 (pseudonymised data is outside strict erasure requirement
+          when irreversibly unlinked to natural person).
+        implementation:
+          - One-way hash (SHA-256 + dedicated erasure salt stored separately)
+          - Erasure salt is itself deleted on erasure completion → rendering hash irreversible
+          - Legal review confirmed: pseudonymised audit records not subject to erasure under GDPR Art. 17(3)(b)
+
+      step_6_complete:
+        action: |
+          UPDATE gdpr.erasure_requests SET
+            status = 'completed',
+            completed_at = NOW()
+          WHERE request_id = :request_id;
+          Send completion email to requester.
+
+      step_7_sla_breach_escalation:
+        trigger: "sla_deadline - 3 days AND status != completed"
+        action: "PagerDuty P2 → DPO + compliance_officer"
+        trigger_2: "sla_deadline passed AND status != completed"
+        action_2: "PagerDuty P1 → DPO + CTO + legal@"
+
+  data_minimisation:
+    principle: "Collect only data necessary for documented purpose"
+    controls:
+      - Supplier questionnaire templates: optional fields clearly marked
+      - Analytics ClickHouse: no raw PII stored (aggregate only)
+      - ML training data: anonymised before use in cross-tenant models
+
+  data_residency:
+    eu_tenants:
+      data_region_constraint: "EU (stored in eu-west-1 only)"
+      enforced_by: "core.tenants.data_region CHECK constraint + RDS cluster in eu-west-1"
+      kafka_replication: EU MSK cluster only
+      s3_buckets: eu-west-1 only
+
+    us_tenants:
+      data_region: "US (stored in us-east-1)"
+
+    cross_region_replication: "Audit logs replicated eu→us for DR, but EU personal data only in EU region"
+
+  dpia_required_activities:
+    - "ML risk scoring of natural persons (supplier contacts)" → DPIA completed 2024-09
+    - "Cross-tenant alternate supplier matching (aggregated data)" → DPIA completed 2024-09
+
+# ==============================================================================
+# CCPA COMPLIANCE CONTROLS (NFR-COMP-002)
+# ==============================================================================
+ccpa:
+  applicability: "Tenants serving California-based suppliers or having California users"
+
+  consumer_rights_implemented:
+    right_to_know:
+      endpoint: "POST /api/v1/compliance/erasure-requests with request_type=access"
+      sla: 45 days
+      response: "JSON export of all personal data held for requester"
+
+    right_to_delete:
+      endpoint: "POST /api/v1/compliance/erasure-requests with request_type=ccpa_deletion"
+      sla: 45 days
+      implementation: "Same workflow as GDPR erasure"
+
+    right_to_opt_out:
+      endpoint: "POST /api/v1/compliance/erasure-requests with request_type=ccpa_optout"
+      scope: "Opt-out of sale/sharing of personal information"
+      implementation: "Set core.users.ccpa_opt_out = TRUE; exclude from any ML training batches"
+
+    right_to_non_discrimination: "No service degradation for exercising CCPA rights"
+
+  privacy_policy_disclosures:
+    - Categories of personal information collected
+    - Purpose of collection
+    - Third parties PI is shared with (sub-processors)
+    - CCPA rights and how to exercise them
+
+# ==============================================================================
+# SOC 2 TYPE II — TRUST SERVICE CRITERIA MAPPING
+# ==============================================================================
+soc2_type_ii:
+  audit_period: annual (Oct 1 → Sep 30)
+  auditor: Big-4 or recognized CPA firm
+  scope: Security, Availability, Confidentiality, Processing Integrity
+
+  criteria_mapping:
+    CC6_1_logical_access_controls:
+      description: "Restrict logical access to assets"
+      controls:
+        - RBAC_8_roles_with_least_privilege
+        - MFA_enforcement (IAM-FR-003)
+        - JWT_15min_expiry_with_revocation
+        - Supplier_portal_isolated_JWTs
+      evidence:
+        - Screenshot of role permission matrix
+        - IAM audit log export (access review)
+        - MFA enrollment % report (target: 100% for privileged roles)
+
+    CC6_2_user_provisioning:
+      description: "New access requests authorized and provisioned correctly"
+      controls:
+        - User invite workflow (IT admin only)
+        - JIT provisioning via SSO group mapping
+        - Quarterly user access review (automated + manual)
+      evidence:
+        - User provisioning workflow documentation
+        - Quarterly access review sign-offs
+
+    CC6_6_network_controls:
+      description: "Logical access boundaries"
+      controls:
+        - VPC private subnets (no public RDS/Redis/MSK)
+        - SecurityGroups_least_privilege
+        - Istio_mTLS_STRICT
+        - NetworkPolicy_default_deny
+        - WAF + Shield Standard
+      evidence:
+        - VPC architecture diagram
+        - SecurityGroup audit (AWS Config)
+        - Istio peer authentication config
+
+    CC7_2_security_event_monitoring:
+      description: "Detect and respond to security incidents"
+      controls:
+        - CloudTrail (all API calls)
+        - GuardDuty (threat detection)
+        - Security Hub (aggregated findings)
+        - PagerDuty (incident response)
+        - Immutable audit log
+      evidence:
+        - GuardDuty finding volume + resolution report
+        - Incident response log (P1/P2 incidents)
+
+    CC8_1_change_management:
+      description: "Changes managed to protect against unauthorized modifications"
+      controls:
+        - GitHub branch protection (2 approvals required)
+        - CI/CD pipeline gates (sast, tests, container scan)
+        - ArgoCD GitOps (all changes via PR)
+        - Terraform state + plan approval
+      evidence:
+        - GitHub PR merge log
+        - ArgoCD sync history
+        - Terraform apply log
+
+    CC9_2_vendor_risk:
+      description: "Vendor risk assessments"
+      controls:
+        - Annual sub-processor security review
+        - DPAs in place for all data processors
+        - AWS BAA (Business Associate Agreement if HIPAA applicable)
+      evidence:
+        - Sub-processor list + review dates
+        - DPA copies
+
+    A1_1_availability:
+      description: "Capacity planning and availability monitoring"
+      controls:
+        - HPA per service (min/max replicas defined)
+        - Karpenter node autoscaling
+        - 99.9% uptime SLA monitoring (Prometheus)
+        - RDS multi-AZ + read replicas
+        - MSK 6-broker multi-AZ
+        - Redis multi-AZ with failover
+      evidence:
+        - Uptime report (99.9%+ target)
+        - DR test records
+
+# ==============================================================================
+# ISO 27001:2022 ANNEX A CONTROL MAPPING
+# ==============================================================================
+iso27001:
+  annex_a_controls:
+    - control: A.5.2_Information_Security_Roles
+      status: implemented
+      evidence: "RBAC roles spec (iam_rbac_spec.yaml), CISO role defined"
+
+    - control: A.5.23_Cloud_Security
+      status: implemented
+      evidence: "AWS Shared Responsibility Model documented; VPC controls; encryption at rest/transit"
+
+    - control: A.6.3_Awareness_Training
+      status: planned
+      evidence: "Annual security awareness training; phishing simulation"
+
+    - control: A.8.2_Privileged_Access_Management
+      status: implemented
+      evidence: "MFA required for privileged roles; quarterly PAM review; Secrets Manager"
+
+    - control: A.8.3_Information_Access_Restriction
+      status: implemented
+      evidence: "RLS-based data isolation; RBAC; data scoping"
+
+    - control: A.8.5_Secure_Authentication
+      status: implemented
+      evidence: "TOTP + FIDO2 MFA; account lockout; bcrypt-12"
+
+    - control: A.8.7_Protection_Against_Malware
+      status: implemented
+      evidence: "Container scanning (Trivy); Gitleaks; ECR image scanning; ClamAV on document uploads"
+
+    - control: A.8.10_Information_Deletion
+      status: implemented
+      evidence: "GDPR erasure workflow (30-day SLA); data retention schedules; S3 lifecycle"
+
+    - control: A.8.12_Data_Leakage_Prevention
+      status: implemented
+      evidence: "PII log masking; S3 public access block; Macie scanning; DLP-flagged STRIDE threats"
+
+    - control: A.8.15_Logging
+      status: implemented
+      evidence: "Immutable audit log; CloudTrail; 7-year retention; structured JSON logs"
+
+    - control: A.8.24_Cryptography
+      status: implemented
+      evidence: "TLS 1.3; AES-256 at rest; RSA-2048 JWT signing; KMS key rotation 90d"
+
+# ==============================================================================
+# DATA RETENTION SCHEDULE
+# ==============================================================================
+data_retention:
+  - data_type: "User personal data (active)"
+    retention: "Duration of account + 2 years"
+    deletion_mechanism: GDPR erasure workflow
+
+  - data_type: "Supplier contact data"
+    retention: "Duration of supplier relationship + 7 years"
+    deletion_mechanism: GDPR erasure workflow
+
+  - data_type: "Audit logs"
+    retention: "7 years (immutable)"
+    storage: PostgreSQL quarterly partitions + S3 WORM archive
+    deletion_mechanism: Partition drop after 7 years; S3 Object Lock release
+
+  - data_type: "Application logs"
+    retention: "90 days in Elasticsearch; archive to S3 Glacier after 30 days"
+    deletion_mechanism: Elasticsearch ILM + S3 lifecycle
+
+  - data_type: "ML training data"
+    retention: "3 years (for model reproducibility)"
+    storage: S3 Glacier Deep Archive after 1 year
+
+  - data_type: "Report outputs"
+    retention: "7 days (auto-deleted by S3 lifecycle)"
+
+  - data_type: "IoT telemetry raw events"
+    retention: "PostgreSQL: 18 months (monthly partitions dropped). S3 archive: 7 years"
+
+  - data_type: "Risk score history"
+    retention: "PostgreSQL: 3 years. ClickHouse: indefinite (compressed)"

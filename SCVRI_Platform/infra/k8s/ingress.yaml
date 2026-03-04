@@ -1,0 +1,166 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NGINX Ingress — routes external traffic to SCVRI services
+#
+# Requires: ingress-nginx controller deployed in the cluster
+#   kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/...
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: scvri-ingress
+  namespace: scvri
+  labels:
+    app.kubernetes.io/part-of: scvri-platform
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "15"
+    # Rate limiting — 100 req/s per IP burst 200
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+    # TLS termination handled at ingress
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # CORS — set per-service via specific ingress if needed
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.scvri.io"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization, Content-Type, X-Request-ID"
+    # Security headers
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains; preload";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+      more_set_headers "X-Request-ID: $request_id";
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.scvri.io
+      secretName: scvri-tls-cert
+  rules:
+    - host: api.scvri.io
+      http:
+        paths:
+          # IAM — Authentication & JWKS
+          - path: /auth(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: iam
+                port:
+                  number: 8000
+          - path: /.well-known(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: iam
+                port:
+                  number: 8000
+          - path: /scim(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: iam
+                port:
+                  number: 8000
+          # IAM REST API
+          - path: /api/v1/users(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: iam
+                port:
+                  number: 8000
+          - path: /api/v1/roles(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: iam
+                port:
+                  number: 8000
+          - path: /api/v1/permissions(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: iam
+                port:
+                  number: 8000
+          # Supplier Management
+          - path: /api/v1/suppliers(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: supplier-management
+                port:
+                  number: 8001
+          - path: /api/v1/scorecards(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: supplier-management
+                port:
+                  number: 8001
+          # Risk Intelligence
+          - path: /api/v1/risk(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: risk-intelligence
+                port:
+                  number: 8002
+          # Visibility
+          - path: /api/v1/visibility(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: visibility
+                port:
+                  number: 8003
+          - path: /api/v1/shipments(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: visibility
+                port:
+                  number: 8003
+          # Alert Engine
+          - path: /api/v1/alerts(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: alert-engine
+                port:
+                  number: 8004
+          - path: /api/v1/notifications(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: alert-engine
+                port:
+                  number: 8004
+          # Integration Layer
+          - path: /api/v1/erp(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: integration
+                port:
+                  number: 8005
+          - path: /api/v1/webhooks(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: integration
+                port:
+                  number: 8005
+          - path: /api/v1/outbound(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: integration
+                port:
+                  number: 8005

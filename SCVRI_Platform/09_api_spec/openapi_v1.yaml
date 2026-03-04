@@ -1,0 +1,1144 @@
+openapi: "3.0.3"
+info:
+  title: SCVRI Platform API
+  description: |
+    Supply Chain Visibility & Risk Intelligence Platform — Full REST API Specification
+    All endpoints require Bearer JWT authentication.
+    Tenant context is always derived from the JWT claim; never from request body.
+    API versioning: URI-based (/api/v1/...). Breaking changes increment version to /api/v2/.
+    Rate limits: returned in response headers X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset.
+  version: "1.0.0"
+  contact:
+    email: api-support@scvri.io
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.scvri.io/api/v1
+    description: Production
+  - url: https://api.staging.scvri.io/api/v1
+    description: Staging
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  headers:
+    X-Request-ID:
+      schema: {type: string, format: uuid}
+      description: Unique request identifier for distributed tracing
+    X-RateLimit-Limit:
+      schema: {type: integer}
+    X-RateLimit-Remaining:
+      schema: {type: integer}
+    X-RateLimit-Reset:
+      schema: {type: integer}
+      description: Unix timestamp when rate limit window resets
+
+  responses:
+    400BadRequest:
+      description: Bad Request — Invalid input parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    401Unauthorized:
+      description: Unauthorized — Invalid or expired JWT
+    403Forbidden:
+      description: Forbidden — Insufficient role permissions
+    404NotFound:
+      description: Resource not found
+    409Conflict:
+      description: Conflict — Duplicate resource
+    422UnprocessableEntity:
+      description: Validation error
+    429TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: {type: integer}
+    500InternalServerError:
+      description: Internal server error
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error_code, message, request_id]
+      properties:
+        error_code: {type: string}
+        message: {type: string}
+        details: {type: array, items: {type: object}}
+        request_id: {type: string, format: uuid}
+        timestamp: {type: string, format: date-time}
+
+    Pagination:
+      type: object
+      properties:
+        total: {type: integer}
+        page: {type: integer}
+        page_size: {type: integer}
+        has_next: {type: boolean}
+
+    SupplierSummary:
+      type: object
+      properties:
+        supplier_id: {type: string, format: uuid}
+        legal_name: {type: string}
+        country_code: {type: string}
+        strategic_tier: {type: string, enum: [strategic, preferred, approved, conditional, disqualified]}
+        procurement_category: {type: string}
+        status: {type: string}
+        risk_score: {type: number}
+        risk_level: {type: string, enum: [critical, high, medium, low]}
+        otd_rate: {type: number}
+        created_at: {type: string, format: date-time}
+
+    SupplierDetail:
+      allOf:
+        - $ref: '#/components/schemas/SupplierSummary'
+        - type: object
+          properties:
+            duns_number: {type: string}
+            trade_name: {type: string}
+            legal_entity_type: {type: string}
+            spend_tier: {type: string}
+            supply_chain_depth: {type: integer}
+            parent_supplier_id: {type: string, format: uuid, nullable: true}
+            address_line1: {type: string}
+            address_line2: {type: string}
+            city: {type: string}
+            state_province: {type: string}
+            postal_code: {type: string}
+            lat: {type: number}
+            lng: {type: number}
+            primary_contact_name: {type: string}
+            primary_contact_email: {type: string}
+            primary_contact_phone: {type: string}
+            diversity_flags: {type: array, items: {type: string}}
+            custom_attributes: {type: object}
+            onboarded_at: {type: string, format: date-time}
+            last_reviewed_at: {type: string, format: date-time}
+
+    RiskScore:
+      type: object
+      properties:
+        supplier_id: {type: string, format: uuid}
+        composite_score: {type: number, minimum: 0, maximum: 100}
+        risk_level: {type: string, enum: [critical, high, medium, low]}
+        dimension_scores:
+          type: object
+          properties:
+            financial: {type: number}
+            operational: {type: number}
+            geopolitical: {type: number}
+            esg: {type: number}
+            concentration: {type: number}
+            cyber: {type: number}
+            natural_hazard: {type: number}
+        top_contributing_factors:
+          type: array
+          items:
+            type: object
+            properties:
+              factor_name: {type: string}
+              dimension: {type: string}
+              shap_value: {type: number}
+              direction: {type: string, enum: [increasing_risk, decreasing_risk]}
+              natural_language: {type: string}
+        model_version: {type: string}
+        scored_at: {type: string, format: date-time}
+        is_stale: {type: boolean}
+        is_overridden: {type: boolean}
+
+    AlertSummary:
+      type: object
+      properties:
+        alert_id: {type: string, format: uuid}
+        severity: {type: string, enum: [critical, high, medium, low]}
+        entity_type: {type: string}
+        entity_id: {type: string}
+        title: {type: string}
+        status: {type: string}
+        generated_at: {type: string, format: date-time}
+        acknowledged_at: {type: string, format: date-time, nullable: true}
+        assigned_to: {type: string, format: uuid, nullable: true}
+        delivery_latency_ms: {type: integer, nullable: true}
+
+    ShipmentSummary:
+      type: object
+      properties:
+        shipment_id: {type: string, format: uuid}
+        po_id: {type: string, format: uuid, nullable: true}
+        supplier_id: {type: string, format: uuid}
+        carrier_name: {type: string}
+        tracking_number: {type: string}
+        transport_mode: {type: string}
+        status: {type: string}
+        origin_country: {type: string}
+        dest_country: {type: string}
+        eta: {type: string, format: date-time}
+        eta_deviation_hours: {type: number}
+        current_location_desc: {type: string}
+        last_event_at: {type: string, format: date-time}
+
+    SupplierScorecard:
+      type: object
+      properties:
+        supplier_id: {type: string, format: uuid}
+        period_start: {type: string, format: date}
+        period_end: {type: string, format: date}
+        otd_rate: {type: number}
+        defect_rate: {type: number}
+        fill_rate: {type: number}
+        invoice_accuracy: {type: number}
+        responsiveness_score: {type: number}
+        perfect_order_rate: {type: number}
+        lead_time_variance: {type: number}
+        overall_score: {type: number}
+        score_grade: {type: string}
+        total_po_lines: {type: integer}
+        total_spend: {type: number}
+        computed_at: {type: string, format: date-time}
+
+    User:
+      type: object
+      properties:
+        user_id: {type: string, format: uuid}
+        email: {type: string, format: email}
+        display_name: {type: string}
+        user_type: {type: string}
+        status: {type: string}
+        roles: {type: array, items: {type: string}}
+        mfa_enrolled: {type: boolean}
+        last_login_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+
+paths:
+  # ===========================================================================
+  # AUTHENTICATION
+  # ===========================================================================
+  /auth/token:
+    post:
+      tags: [Authentication]
+      summary: Exchange credentials or SSO assertion for JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                grant_type: {type: string, enum: [password, refresh_token, saml_assertion, oidc_code]}
+                client_id: {type: string}
+                username: {type: string}
+                password: {type: string}
+                refresh_token: {type: string}
+                saml_assertion: {type: string}
+                oidc_code: {type: string}
+                mfa_token: {type: string}
+                tenant_slug: {type: string, required: true}
+      responses:
+        "200":
+          description: JWT tokens
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token: {type: string}
+                  refresh_token: {type: string}
+                  token_type: {type: string, default: Bearer}
+                  expires_in: {type: integer}
+                  tenant_id: {type: string, format: uuid}
+                  user_id: {type: string, format: uuid}
+                  roles: {type: array, items: {type: string}}
+        "401": {$ref: '#/components/responses/401Unauthorized'}
+        "429": {$ref: '#/components/responses/429TooManyRequests'}
+
+  # ===========================================================================
+  # SUPPLIERS
+  # ===========================================================================
+  /suppliers:
+    get:
+      tags: [Suppliers]
+      summary: List suppliers (SUP-FR-001)
+      parameters:
+        - in: query
+          name: status
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: strategic_tier
+          schema: {type: string}
+        - in: query
+          name: category
+          schema: {type: string}
+        - in: query
+          name: country_code
+          schema: {type: string}
+        - in: query
+          name: risk_score_min
+          schema: {type: number}
+        - in: query
+          name: risk_score_max
+          schema: {type: number}
+        - in: query
+          name: search
+          schema: {type: string}
+          description: Fuzzy name search using pg_trgm
+        - in: query
+          name: page
+          schema: {type: integer, default: 1}
+        - in: query
+          name: page_size
+          schema: {type: integer, default: 50, maximum: 200}
+        - in: query
+          name: sort_by
+          schema: {type: string, enum: [legal_name, risk_score, otd_rate, created_at], default: legal_name}
+        - in: query
+          name: sort_dir
+          schema: {type: string, enum: [asc, desc], default: asc}
+      responses:
+        "200":
+          description: Paginated supplier list
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      items: {type: array, items: {$ref: '#/components/schemas/SupplierSummary'}}
+        "401": {$ref: '#/components/responses/401Unauthorized'}
+      x-rate-limit: "1000/min per tenant"
+      x-cache: "redis, ttl=60s, key=suppliers:{tenant}:{filter_hash}"
+
+    post:
+      tags: [Suppliers]
+      summary: Create supplier (SUP-FR-001)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SupplierDetail'
+      responses:
+        "201":
+          description: Supplier created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupplierDetail'
+        "400": {$ref: '#/components/responses/400BadRequest'}
+        "409": {$ref: '#/components/responses/409Conflict'}
+      x-audit: "supplier.create"
+
+  /suppliers/{supplierId}:
+    parameters:
+      - in: path
+        name: supplierId
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      tags: [Suppliers]
+      summary: Get supplier 360-degree profile (SUP-FR-010)
+      responses:
+        "200":
+          description: Full supplier profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  supplier: {$ref: '#/components/schemas/SupplierDetail'}
+                  risk_score: {$ref: '#/components/schemas/RiskScore'}
+                  latest_scorecard: {$ref: '#/components/schemas/SupplierScorecard'}
+                  active_pos_count: {type: integer}
+                  active_shipments_count: {type: integer}
+                  open_certifications: {type: array}
+                  active_incidents: {type: array}
+                  spend_ytd_usd: {type: number}
+      x-cache: "redis, ttl=120s"
+    put:
+      tags: [Suppliers]
+      summary: Update supplier
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SupplierDetail'
+      responses:
+        "200":
+          description: Updated supplier
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupplierDetail'
+      x-audit: "supplier.update"
+    delete:
+      tags: [Suppliers]
+      summary: Soft-delete supplier (GDPR compliance — not hard delete)
+      responses:
+        "204":
+          description: Supplier soft-deleted
+      x-audit: "supplier.delete"
+      x-required-role: "procurement_officer"
+
+  /suppliers/{supplierId}/scorecard:
+    get:
+      tags: [Suppliers]
+      summary: Supplier performance scorecard (SUP-FR-004)
+      parameters:
+        - in: path
+          name: supplierId
+          required: true
+          schema: {type: string, format: uuid}
+        - in: query
+          name: period_months
+          schema: {type: integer, default: 3}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SupplierScorecard'
+
+  /suppliers/{supplierId}/documents:
+    get:
+      tags: [Suppliers]
+      summary: List supplier documents (SUP-FR-003)
+      parameters:
+        - in: path
+          name: supplierId
+          required: true
+          schema: {type: string, format: uuid}
+        - in: query
+          name: doc_type
+          schema: {type: string}
+        - in: query
+          name: expiring_within_days
+          schema: {type: integer}
+          description: Filter certs expiring within N days
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    doc_id: {type: string, format: uuid}
+                    doc_type: {type: string}
+                    doc_name: {type: string}
+                    version: {type: integer}
+                    expiry_date: {type: string, format: date}
+                    days_until_expiry: {type: integer}
+                    uploaded_by: {type: string, format: uuid}
+                    upload_source: {type: string}
+                    created_at: {type: string, format: date-time}
+    post:
+      tags: [Suppliers]
+      summary: Upload supplier document (SUP-FR-003)
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                doc_type: {type: string}
+                doc_name: {type: string}
+                file: {type: string, format: binary}
+                issued_date: {type: string, format: date}
+                expiry_date: {type: string, format: date}
+      responses:
+        "201":
+          description: Document uploaded; S3 pre-signed upload URL returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  doc_id: {type: string, format: uuid}
+                  upload_url: {type: string, format: uri}
+                  expires_in_seconds: {type: integer}
+      x-audit: "supplier.document.upload"
+
+  # ===========================================================================
+  # RISK
+  # ===========================================================================
+  /risk/suppliers/{supplierId}/score:
+    get:
+      tags: [Risk Intelligence]
+      summary: Current risk score with SHAP explainability (RISK-FR-001, RISK-FR-002)
+      parameters:
+        - in: path
+          name: supplierId
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskScore'
+
+  /risk/suppliers/{supplierId}/score/override:
+    post:
+      tags: [Risk Intelligence]
+      summary: Human override of AI risk score (AI Governance)
+      parameters:
+        - in: path
+          name: supplierId
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [override_score, reason, valid_until]
+              properties:
+                override_score: {type: number, minimum: 0, maximum: 100}
+                reason: {type: string, minLength: 20}
+                valid_until: {type: string, format: date-time}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  score_id: {type: string, format: uuid}
+                  override_applied: {type: boolean}
+      x-required-role: "risk_analyst"
+      x-audit: "risk.score.override"
+      x-mfa-required: true
+
+  /risk/heatmap:
+    get:
+      tags: [Risk Intelligence]
+      summary: Global risk heatmap (RISK-FR-005)
+      parameters:
+        - in: query
+          name: group_by
+          schema: {type: string, enum: [country, region, category], default: country}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    group_key: {type: string}
+                    avg_risk_score: {type: number}
+                    supplier_count: {type: integer}
+                    high_risk_count: {type: integer}
+                    spend_usd: {type: number}
+
+  /risk/scenarios/simulate:
+    post:
+      tags: [Risk Intelligence]
+      summary: Run disruption scenario simulation (RISK-FR-011)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [disruption_type, duration_days]
+              properties:
+                disruption_type:
+                  type: string
+                  enum: [supplier_failure, port_closure, regional_conflict, natural_disaster, logistic_delay, tariff_increase]
+                affected_supplier_ids:
+                  type: array
+                  items: {type: string, format: uuid}
+                affected_countries:
+                  type: array
+                  items: {type: string}
+                severity: {type: string, enum: [partial, full]}
+                duration_days: {type: integer, minimum: 1, maximum: 365}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scenario_id: {type: string, format: uuid}
+                  impacted_pos: {type: integer}
+                  spend_at_risk_usd: {type: number}
+                  alternate_suppliers: {type: array}
+                  financial_impact_usd: {type: number}
+      x-rate-limit-per-user: "10/hour"
+
+  # ===========================================================================
+  # VISIBILITY
+  # ===========================================================================
+  /visibility/supply-chain-map:
+    get:
+      tags: [Visibility]
+      summary: Supply chain graph map (VIS-FR-001)
+      parameters:
+        - in: query
+          name: tier
+          schema: {type: integer, enum: [1, 2, 3], default: 1}
+        - in: query
+          name: include_risk_scores
+          schema: {type: boolean, default: false}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes: {type: array}
+                  edges: {type: array}
+                  meta: {type: object}
+      x-cache: "redis, ttl=60s"
+
+  /visibility/shipments:
+    get:
+      tags: [Visibility]
+      summary: List shipments with tracking (VIS-FR-002)
+      parameters:
+        - in: query
+          name: status
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: supplier_id
+          schema: {type: string, format: uuid}
+        - in: query
+          name: overdue_only
+          schema: {type: boolean}
+        - in: query
+          name: page
+          schema: {type: integer, default: 1}
+        - in: query
+          name: page_size
+          schema: {type: integer, default: 50, maximum: 200}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      items: {type: array, items: {$ref: '#/components/schemas/ShipmentSummary'}}
+
+  /visibility/spend-at-risk:
+    get:
+      tags: [Visibility]
+      summary: Spend at risk by entity (VIS-FR-011)
+      parameters:
+        - in: query
+          name: risk_threshold
+          schema: {type: number, default: 70}
+        - in: query
+          name: group_by
+          schema: {type: string, enum: [supplier, country, category], default: supplier}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_spend_at_risk_usd: {type: number}
+                  groups: {type: array}
+
+  # ===========================================================================
+  # ALERTS
+  # ===========================================================================
+  /alerts:
+    get:
+      tags: [Alerts]
+      summary: Alert inbox (ALERT-FR-005)
+      parameters:
+        - in: query
+          name: status
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: severity
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: page
+          schema: {type: integer, default: 1}
+        - in: query
+          name: page_size
+          schema: {type: integer, default: 50}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      items: {type: array, items: {$ref: '#/components/schemas/AlertSummary'}}
+                      unread_count: {type: integer}
+
+  /alerts/{alertId}/acknowledge:
+    post:
+      tags: [Alerts]
+      parameters:
+        - in: path
+          name: alertId
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertSummary'
+      x-audit: "alert.acknowledge"
+
+  /alerts/{alertId}/resolve:
+    post:
+      tags: [Alerts]
+      parameters:
+        - in: path
+          name: alertId
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resolution_notes]
+              properties:
+                resolution_notes: {type: string, minLength: 10}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertSummary'
+      x-audit: "alert.resolve"
+
+  /alerts/rules:
+    get:
+      tags: [Alerts]
+      summary: List alert rules (ALERT-FR-002)
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    rule_id: {type: string, format: uuid}
+                    rule_name: {type: string}
+                    conditions: {type: object}
+                    severity: {type: string}
+                    delivery_channels: {type: array}
+                    is_active: {type: boolean}
+    post:
+      tags: [Alerts]
+      summary: Create alert rule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rule_name, conditions, severity]
+              properties:
+                rule_name: {type: string}
+                conditions: {type: array, items: {type: object}}
+                severity: {type: string, enum: [critical, high, medium, low]}
+                delivery_channels: {type: array, items: {type: string}}
+                escalation_config: {type: object}
+                dedup_window_minutes: {type: integer, default: 60}
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rule_id: {type: string, format: uuid}
+      x-required-role: "supply_chain_manager"
+      x-audit: "alert.rule.create"
+
+  # ===========================================================================
+  # ANALYTICS & REPORTING
+  # ===========================================================================
+  /reports:
+    get:
+      tags: [Analytics]
+      summary: List available report templates (RPT-FR-002)
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    report_id: {type: string}
+                    report_name: {type: string}
+                    category: {type: string}
+                    description: {type: string}
+                    params: {type: array}
+
+  /reports/{reportId}/generate:
+    post:
+      tags: [Analytics]
+      summary: Generate a report (RPT-FR-002, RPT-FR-007)
+      parameters:
+        - in: path
+          name: reportId
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                format: {type: string, enum: [pdf, xlsx, csv, png], default: pdf}
+                params: {type: object}
+                date_range_start: {type: string, format: date}
+                date_range_end: {type: string, format: date}
+                filters: {type: object}
+      responses:
+        "202":
+          description: Report generation queued; poll job_id for result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: {type: string, format: uuid}
+                  estimated_seconds: {type: integer}
+      x-audit: "report.generate"
+
+  /reports/jobs/{jobId}:
+    get:
+      tags: [Analytics]
+      summary: Check report generation status and get download URL
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: {type: string, format: uuid}
+                  status: {type: string, enum: [queued, processing, completed, failed]}
+                  download_url: {type: string, format: uri, nullable: true}
+                  url_expires_at: {type: string, format: date-time, nullable: true}
+                  error_message: {type: string, nullable: true}
+
+  /reports/schedules:
+    post:
+      tags: [Analytics]
+      summary: Schedule recurring report delivery (RPT-FR-004)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [report_id, frequency, delivery_emails, format]
+              properties:
+                report_id: {type: string}
+                frequency: {type: string, enum: [daily, weekly, monthly]}
+                cron_override: {type: string}
+                delivery_emails: {type: array, items: {type: string, format: email}}
+                format: {type: string, enum: [pdf, xlsx, csv]}
+                params: {type: object}
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schedule_id: {type: string, format: uuid}
+                  next_run_at: {type: string, format: date-time}
+
+  # ===========================================================================
+  # IAM
+  # ===========================================================================
+  /admin/users:
+    get:
+      tags: [Administration]
+      summary: List users (IAM-FR-001)
+      x-required-role: "it_administrator"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/User'
+    post:
+      tags: [Administration]
+      summary: Invite user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, display_name, role_ids]
+              properties:
+                email: {type: string, format: email}
+                display_name: {type: string}
+                role_ids: {type: array, items: {type: string, format: uuid}}
+                data_scope: {type: object}
+      responses:
+        "201":
+          description: Invitation sent
+      x-audit: "user.invite"
+      x-required-role: "it_administrator"
+
+  /admin/users/{userId}:
+    put:
+      tags: [Administration]
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: {type: string, enum: [active, locked, deactivated]}
+                role_ids: {type: array, items: {type: string, format: uuid}}
+                data_scope: {type: object}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+      x-audit: "user.update"
+      x-required-role: "it_administrator"
+
+  /admin/roles:
+    get:
+      tags: [Administration]
+      summary: List roles with permissions (IAM-FR-001)
+      x-required-role: "it_administrator"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    role_id: {type: string, format: uuid}
+                    role_name: {type: string}
+                    role_type: {type: string}
+                    permissions: {type: array}
+
+  /admin/audit-log:
+    get:
+      tags: [Administration]
+      summary: Platform audit log (IAM-FR-005)
+      x-required-role: "compliance_officer || it_administrator"
+      parameters:
+        - in: query
+          name: actor_id
+          schema: {type: string, format: uuid}
+        - in: query
+          name: action
+          schema: {type: string}
+        - in: query
+          name: from_time
+          schema: {type: string, format: date-time}
+        - in: query
+          name: to_time
+          schema: {type: string, format: date-time}
+        - in: query
+          name: page
+          schema: {type: integer, default: 1}
+        - in: query
+          name: page_size
+          schema: {type: integer, default: 100}
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            log_id: {type: string, format: uuid}
+                            occurred_at: {type: string, format: date-time}
+                            actor_type: {type: string}
+                            actor_id: {type: string, format: uuid}
+                            actor_email: {type: string}
+                            action: {type: string}
+                            resource_type: {type: string}
+                            resource_id: {type: string}
+                            outcome: {type: string}
+                            ip_address: {type: string}
+
+  # ===========================================================================
+  # GDPR / COMPLIANCE
+  # ===========================================================================
+  /compliance/erasure-requests:
+    post:
+      tags: [Compliance]
+      summary: Submit GDPR erasure or CCPA deletion request (NFR-COMP-001/002)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requester_email, request_type, regulation]
+              properties:
+                requester_email: {type: string, format: email}
+                request_type: {type: string, enum: [erasure, access, portability, ccpa_deletion, ccpa_optout]}
+                regulation: {type: string, enum: [gdpr, ccpa, both]}
+                identity_verification_token: {type: string}
+      responses:
+        "202":
+          description: Request accepted. Will be processed within 30 days.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id: {type: string, format: uuid}
+                  sla_deadline: {type: string, format: date-time}
+
+  # ===========================================================================
+  # WEBHOOKS
+  # ===========================================================================
+  /webhooks:
+    get:
+      tags: [Integrations]
+      summary: List webhook subscriptions (INT-FR-003)
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    webhook_id: {type: string, format: uuid}
+                    endpoint_url: {type: string, format: uri}
+                    events: {type: array, items: {type: string}}
+                    is_active: {type: boolean}
+                    created_at: {type: string, format: date-time}
+    post:
+      tags: [Integrations]
+      summary: Create webhook subscription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [endpoint_url, events]
+              properties:
+                endpoint_url: {type: string, format: uri}
+                events:
+                  type: array
+                  items:
+                    type: string
+                    enum:
+                      - risk_score.critical
+                      - risk_score.delta_10
+                      - shipment.status_changed
+                      - alert.critical_generated
+                      - supplier.status_changed
+                      - po.status_changed
+                secret:
+                  type: string
+                  description: HMAC signing secret; auto-generated if not provided
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhook_id: {type: string, format: uuid}
+                  signing_secret: {type: string}
+                  description: "Store this secret securely. Cannot be retrieved again."
+      x-audit: "webhook.create"
+
+  # ===========================================================================
+  # HEALTH
+  # ===========================================================================
+  /health:
+    get:
+      tags: [Operations]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [ok, degraded, down]}
+                  timestamp: {type: string, format: date-time}
+  /ready:
+    get:
+      tags: [Operations]
+      summary: Readiness probe
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [ready, not_ready]}
+                  checks:
+                    type: object
+                    properties:
+                      database: {type: string}
+                      redis: {type: string}
+                      kafka: {type: string}

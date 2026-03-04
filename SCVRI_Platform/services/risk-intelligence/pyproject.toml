@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "risk-intelligence"
+version = "1.0.0"
+description = "SCVRI Risk Intelligence Engine — ML-powered supplier risk scoring and KRI evaluation"
+requires-python = ">=3.12"
+dependencies = [
+    "scvri-shared",
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.32.1",
+    "httpx==0.28.1",
+    # ML
+    "scikit-learn==1.5.2",
+    "xgboost==2.1.3",
+    "lightgbm==4.5.0",
+    "pandas==2.2.3",
+    "numpy==2.1.3",
+    "joblib==1.4.2",
+    # S3 model registry
+    "boto3==1.35.80",
+    "botocore==1.35.80",
+    # News / external data
+    "aiohttp==3.11.10",
+    # Workers
+    "celery[redis]==5.4.0",
+    "sqlalchemy[asyncio]==2.0.36",
+    "asyncpg==0.30.0",
+    "psycopg2-binary==2.9.10",
+    "redis[hiredis]==5.2.0",
+    "aiokafka==0.11.0",
+    # Observability
+    "opentelemetry-sdk==1.29.0",
+    "opentelemetry-instrumentation-fastapi==0.50b0",
+    "opentelemetry-exporter-otlp-proto-grpc==1.29.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.24.0",
+    "pytest-cov==6.0.0",
+    "httpx==0.28.1",
+    "moto[s3]==5.0.21",
+    "factory-boy==3.3.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/risk_intelligence"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

@@ -1,0 +1,328 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Integration Layer — port 8005
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: integration
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: integration
+    app.kubernetes.io/part-of: scvri-platform
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: integration
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: integration
+        app.kubernetes.io/part-of: scvri-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8005"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: scvri-integration
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: integration
+                topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: integration
+          image: ghcr.io/scvri/integration:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8005
+              name: http
+          envFrom:
+            - configMapRef:
+                name: scvri-common
+            - configMapRef:
+                name: scvri-integration-config
+            - secretRef:
+                name: scvri-postgres-secret
+            - secretRef:
+                name: scvri-redis-secret
+            - secretRef:
+                name: scvri-integration-secret
+          env:
+            - name: IAM_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: scvri-iam-keys
+                  key: IAM_PUBLIC_KEY
+          resources:
+            requests:
+              cpu: "300m"
+              memory: "384Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8005
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8005
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 4
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# Celery worker — ERP sync + outbound delivery retries
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: integration-worker
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: integration-worker
+    app.kubernetes.io/part-of: scvri-platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: integration-worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: integration-worker
+        app.kubernetes.io/part-of: scvri-platform
+    spec:
+      serviceAccountName: scvri-integration
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      terminationGracePeriodSeconds: 120   # longer for ERP sync tasks
+      containers:
+        - name: integration-worker
+          image: ghcr.io/scvri/integration:1.0.0
+          command:
+            - celery
+            - --app=integration.workers.celery_app
+            - worker
+            - --loglevel=INFO
+            - --concurrency=4
+            - -Q
+            - erp_sync,outbound,default
+          envFrom:
+            - configMapRef:
+                name: scvri-common
+            - configMapRef:
+                name: scvri-integration-config
+            - secretRef:
+                name: scvri-postgres-secret
+            - secretRef:
+                name: scvri-redis-secret
+            - secretRef:
+                name: scvri-integration-secret
+          env:
+            - name: IAM_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: scvri-iam-keys
+                  key: IAM_PUBLIC_KEY
+          resources:
+            requests:
+              cpu: "300m"
+              memory: "384Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# Celery Beat — ERP scheduled sync every 6 hours, retry every 15 min
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: integration-beat
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: integration-beat
+    app.kubernetes.io/part-of: scvri-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: integration-beat
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: integration-beat
+        app.kubernetes.io/part-of: scvri-platform
+    spec:
+      serviceAccountName: scvri-integration
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: integration-beat
+          image: ghcr.io/scvri/integration:1.0.0
+          command:
+            - celery
+            - --app=integration.workers.celery_app
+            - beat
+            - --loglevel=INFO
+            - -s
+            - /tmp/celerybeat-schedule
+          envFrom:
+            - configMapRef:
+                name: scvri-common
+            - configMapRef:
+                name: scvri-integration-config
+            - secretRef:
+                name: scvri-postgres-secret
+            - secretRef:
+                name: scvri-redis-secret
+            - secretRef:
+                name: scvri-integration-secret
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: integration
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: integration
+    app.kubernetes.io/part-of: scvri-platform
+spec:
+  selector:
+    app.kubernetes.io/name: integration
+  ports:
+    - port: 8005
+      targetPort: 8005
+      name: http
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: integration
+  namespace: scvri
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: integration
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: integration-worker
+  namespace: scvri
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: integration-worker
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scvri-integration
+  namespace: scvri

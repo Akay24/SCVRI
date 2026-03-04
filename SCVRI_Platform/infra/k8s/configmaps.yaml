@@ -1,0 +1,132 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared platform ConfigMap — values injected into every service pod.
+# Values that differ per service are in their own ConfigMaps.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scvri-common
+  namespace: scvri
+  labels:
+    app.kubernetes.io/part-of: scvri-platform
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  # PostgreSQL (shared cluster, each service uses its own schema)
+  DATABASE_HOST: "postgresql.scvri.svc.cluster.local"
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: "scvri"
+  # Redis
+  REDIS_HOST: "redis-master.scvri.svc.cluster.local"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+  # Kafka
+  KAFKA_BOOTSTRAP_SERVERS: "kafka.scvri.svc.cluster.local:9092"
+  # IAM public key endpoint (used by downstream services)
+  IAM_JWKS_URI: "http://iam.scvri.svc.cluster.local:8000/.well-known/jwks.json"
+  # Telemetry
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.scvri.svc.cluster.local:4317"
+  OTEL_SERVICE_NAMESPACE: "scvri"
+---
+# ── IAM Service ───────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scvri-iam-config
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: iam
+    app.kubernetes.io/part-of: scvri-platform
+data:
+  SERVICE_NAME: "iam"
+  SERVICE_PORT: "8000"
+  DATABASE_SCHEMA: "iam"
+  REDIS_DB: "0"
+  ACCESS_TOKEN_TTL_SECONDS: "3600"
+  REFRESH_TOKEN_TTL_SECONDS: "2592000"
+  MFA_SESSION_TTL_SECONDS: "300"
+  TOTP_ISSUER: "SCVRI Platform"
+---
+# ── Supplier Management Service ───────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scvri-supplier-config
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: supplier-management
+    app.kubernetes.io/part-of: scvri-platform
+data:
+  SERVICE_NAME: "supplier-management"
+  SERVICE_PORT: "8001"
+  DATABASE_SCHEMA: "supplier"
+  REDIS_DB: "1"
+---
+# ── Risk Intelligence Engine ──────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scvri-risk-config
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: risk-intelligence
+    app.kubernetes.io/part-of: scvri-platform
+data:
+  SERVICE_NAME: "risk-intelligence"
+  SERVICE_PORT: "8002"
+  DATABASE_SCHEMA: "risk"
+  REDIS_DB: "2"
+  RISK_SCORE_KAFKA_TOPIC: "risk.score_updates"
+  RISK_EVENTS_KAFKA_TOPIC: "risk.events"
+---
+# ── Visibility Service ────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scvri-visibility-config
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: visibility
+    app.kubernetes.io/part-of: scvri-platform
+data:
+  SERVICE_NAME: "visibility"
+  SERVICE_PORT: "8003"
+  DATABASE_SCHEMA: "visibility"
+  REDIS_DB: "3"
+  SHIPMENT_KAFKA_TOPIC: "visibility.shipment_events"
+---
+# ── Alert Engine ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scvri-alert-config
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: alert-engine
+    app.kubernetes.io/part-of: scvri-platform
+data:
+  SERVICE_NAME: "alert-engine"
+  SERVICE_PORT: "8004"
+  DATABASE_SCHEMA: "alerts"
+  REDIS_DB: "4"
+  ALERT_KAFKA_TOPIC: "alerts.triggered"
+---
+# ── Integration Layer ─────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scvri-integration-config
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: integration
+    app.kubernetes.io/part-of: scvri-platform
+data:
+  SERVICE_NAME: "integration"
+  SERVICE_PORT: "8005"
+  DATABASE_SCHEMA: "integration"
+  REDIS_DB: "5"
+  ERP_EVENTS_KAFKA_TOPIC: "integration.erp.events"
+  WEBHOOK_EVENTS_KAFKA_TOPIC: "integration.webhook.events"
+  OUTBOUND_DELIVERIES_KAFKA_TOPIC: "integration.outbound.deliveries"
+  WEBHOOK_RATE_LIMIT: "500"
+  ERP_PULL_RATE_LIMIT: "10"

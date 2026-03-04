@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "visibility"
+version = "0.1.0"
+description = "SCVRI Visibility Service – Purchase Order state machine, shipment tracking, IoT telemetry ingest"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.32.1",
+    "pydantic==2.10.4",
+    "pydantic-settings==2.7.0",
+    "sqlalchemy==2.0.36",
+    "asyncpg==0.30.0",
+    "alembic==1.14.0",
+    "celery[redis]==5.4.0",
+    "aiokafka==0.11.0",
+    "httpx==0.28.1",
+    "geopy==2.4.1",          # distance / geo calculations for telemetry
+    "shapely==2.0.6",         # geofence polygon intersection
+    "tenacity==9.0.0",
+    "structlog==24.4.0",
+    "scvri-shared @ file://../../shared",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.24.0",
+    "pytest-cov==6.0.0",
+    "httpx==0.28.1",
+    "moto[s3]==5.0.21",
+    "freezegun==1.5.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/visibility"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iam"
+version = "1.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.32.1",
+    "pydantic==2.10.3",
+    "pydantic-settings==2.7.0",
+    "sqlalchemy==2.0.36",
+    "asyncpg==0.30.0",
+    "alembic==1.14.0",
+    "redis==5.2.1",
+    "celery==5.4.0",
+    "python-jose[cryptography]==3.3.0",   # JWT RS256 signing / verification
+    "passlib[bcrypt]==1.7.4",              # bcrypt password hashing
+    "pyotp==2.9.0",                        # TOTP MFA (RFC 6238)
+    "qrcode[pil]==8.0",                    # QR code for TOTP provisioning URI
+    "httpx==0.28.1",
+    "scvri-shared @ file:///${PROJECT_ROOT}/shared",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.24.0",
+    "pytest-cov==6.0.0",
+    "httpx==0.28.1",
+    "respx==0.21.1",
+    "factory-boy==3.3.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iam"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["src/iam"]

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "integration"
+version = "1.0.0"
+description = "SCVRI Integration Layer — ERP connectors, webhook ingestion, event normalisation"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.0",
+    "uvicorn[standard]==0.30.6",
+    "pydantic==2.9.2",
+    "pydantic-settings==2.5.2",
+    "httpx==0.27.2",
+    "aiokafka==0.11.0",
+    "redis[asyncio]==5.1.1",
+    "tenacity==9.0.0",
+    "celery[redis]==5.4.0",
+    "cryptography==43.0.1",
+    "python-jose[cryptography]==3.3.0",
+    "asyncpg==0.30.0",
+    "sqlalchemy[asyncio]==2.0.36",
+    "scvri-shared @ file:///${PROJECT_ROOT}/shared",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.3",
+    "pytest-asyncio==0.24.0",
+    "pytest-mock==3.14.0",
+    "httpx==0.27.2",
+    "respx==0.21.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/integration"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

@@ -1,0 +1,392 @@
+##############################################################################
+# MODULE 8 — IAM & RBAC SERVICE SPECIFICATION
+# SRS Coverage: IAM-FR-001..006, NFR-SEC-003..005
+# Version: 1.0.0
+##############################################################################
+
+service:
+  name: iam-rbac-service
+  language: Python 3.12
+  framework: FastAPI 0.111
+  port: 8001
+  k8s_namespace: scvri-prod
+
+# ------------------------------------------------------------------------------
+# 1. RESPONSIBILITIES
+# ------------------------------------------------------------------------------
+responsibilities:
+  - User lifecycle management: invite, activate, lock, deactivate (IAM-FR-001)
+  - 8 pre-defined roles with granular permission matrix (IAM-FR-001)
+  - SAML 2.0 / OpenID Connect SSO federated identity (IAM-FR-002)
+  - MFA enforcement: TOTP (RFC 6238) + FIDO2/WebAuthn (IAM-FR-003)
+  - JWT issuance, rotation, and revocation (RS256, 15-min access, 7-day refresh)
+  - User data scoping: segment, category, geo restrictions (IAM-FR-004)
+  - Comprehensive access audit trail (IAM-FR-005)
+  - Supplier portal isolated access (IAM-FR-006)
+  - Session management: concurrent session limits, device tracking
+
+# ------------------------------------------------------------------------------
+# 2. ROLE DEFINITIONS (IAM-FR-001)
+# ------------------------------------------------------------------------------
+roles:
+  - role_name: supply_chain_executive
+    role_type: platform
+    description: "C-suite / VP level. Full read access + scenario simulation. Cannot manage users."
+    permissions:
+      dashboard: [read]
+      suppliers: [read]
+      risk: [read, simulate_scenarios]
+      alerts: [read, acknowledge, resolve]
+      reports: [read, generate, schedule]
+      shipments: [read]
+      purchase_orders: [read]
+      analytics: [read, export]
+      admin: []
+
+  - role_name: supply_chain_manager
+    role_type: platform
+    description: "Operational supply chain management. Full visibility + alert rule creation."
+    permissions:
+      dashboard: [read]
+      suppliers: [read, update]
+      risk: [read, simulate_scenarios]
+      alerts: [read, acknowledge, resolve, create_rules, delete_rules]
+      reports: [read, generate, schedule]
+      shipments: [read]
+      purchase_orders: [read]
+      analytics: [read, export]
+      admin: []
+
+  - role_name: procurement_officer
+    role_type: platform
+    description: "Day-to-day procurement. Supplier CUD + PO management."
+    permissions:
+      suppliers: [read, create, update, manage_documents, initiate_onboarding, manage_corrective_actions]
+      risk: [read]
+      alerts: [read, acknowledge]
+      reports: [read, generate]
+      shipments: [read]
+      purchase_orders: [read, create, update]
+      analytics: [read]
+
+  - role_name: risk_analyst
+    role_type: platform
+    description: "Risk analysis, model monitoring, score overrides."
+    permissions:
+      suppliers: [read]
+      risk: [read, override_score, view_explainability, view_model_metrics, manage_risk_events]
+      alerts: [read, acknowledge, resolve]
+      reports: [read, generate]
+      analytics: [read, export]
+
+  - role_name: compliance_officer
+    role_type: platform
+    description: "GDPR/SOC2 compliance. Audit log access, erasure request processing, cross-tenant bias reports."
+    permissions:
+      suppliers: [read]
+      risk: [read, view_global_alternate_pool]
+      alerts: [read]
+      audit_log: [read, export]
+      compliance: [read, process_erasure_requests, generate_compliance_reports]
+      reports: [read, generate]
+      analytics: [read, export]
+
+  - role_name: it_administrator
+    role_type: platform
+    description: "User and SSO management. Cannot access supply chain data."
+    permissions:
+      admin_users: [read, invite, update_roles, lock, deactivate]
+      admin_sso: [read, configure]
+      admin_mfa: [read, configure, enforce]
+      admin_audit_log: [read]
+      admin_roles: [read]
+      admin_webhooks: [read, create, delete]
+      admin_api_keys: [read, create, revoke]
+
+  - role_name: ml_lead
+    role_type: platform
+    description: "ML model governance. Model deployment, bias reports, feature drift."
+    permissions:
+      ml_models: [read, deploy, rollback, view_metrics, manage_training]
+      risk: [read, view_explainability, view_bias_reports, access_alternate_pool_global]
+      analytics: [read]
+
+  - role_name: supplier_portal_user
+    role_type: portal
+    description: "External supplier users. Access own supplier data only. Isolated JWT scope."
+    permissions:
+      own_supplier_profile: [read, update_contacts]
+      own_documents: [read, upload]
+      own_corrective_actions: [read, respond]
+      own_purchase_orders: [read]
+      own_scorecards: [read]
+      # All other access: DENIED
+    data_isolation:
+      mechanism: "RLS policy supplier_portal_isolation: row.supplier_id = jwt.supplier_id"
+      jwt_additional_claims: {supplier_id: uuid, user_type: supplier_portal}
+
+permission_matrix:
+  # Compact form — all roles × resources
+  #                         exec    mgr     proc    analyst  compliance  it_admin  ml_lead  portal
+  supplier_read:          [true,  true,   true,   true,    true,       false,    false,   own_only]
+  supplier_create:        [false, false,  true,   false,   false,      false,    false,   false]
+  supplier_delete:        [false, false,  false,  false,   false,      false,    false,   false]
+  risk_score_read:        [true,  true,   true,   true,    true,       false,    true,    false]
+  risk_score_override:    [false, false,  false,  true,    false,      false,    false,   false]
+  alert_rule_create:      [false, true,   false,  false,   false,      false,    false,   false]
+  audit_log_read:         [false, false,  false,  false,   true,       true,     false,   false]
+  user_management:        [false, false,  false,  false,   false,      true,     false,   false]
+  compliance_reports:     [false, false,  false,  false,   true,       false,    false,   false]
+  ml_model_deploy:        [false, false,  false,  false,   false,      false,    true,    false]
+
+# ------------------------------------------------------------------------------
+# 3. DATA SCOPING (IAM-FR-004)
+# ------------------------------------------------------------------------------
+data_scoping:
+  description: |
+    Users can be further restricted to subsets of data within their role.
+    Implemented via core.user_data_scopes table + JWT claim injection.
+
+  scope_dimensions:
+    - dimension: procurement_category
+      description: "Limit user to specific procurement categories (e.g., 'electronics', 'raw_materials')"
+      storage: user_data_scopes.scope_value
+      enforcement: WHERE supply.suppliers.procurement_category = ANY(scope_values)
+
+    - dimension: supplier_segment
+      description: "Limit user to strategic/preferred/approved tiers"
+      storage: user_data_scopes.scope_value
+      enforcement: WHERE supply.suppliers.strategic_tier = ANY(scope_values)
+
+    - dimension: geo_region
+      description: "Limit user to specific countries or regions (ISO 3166-1)"
+      storage: user_data_scopes.scope_value
+      enforcement: WHERE supply.suppliers.country_code = ANY(scope_values)
+
+  jwt_claim_injection:
+    scope_claim: scvri_scope
+    format:
+      scvri_scope:
+        categories: ["electronics", "raw_materials"]
+        tiers: ["strategic", "preferred"]
+        geos: ["US", "DE", "GB"]
+    usage: "FastAPI middleware reads scvri_scope; injects into postgres SET LOCAL app.scope_{dimension} = value; RLS policies use current_setting('app.scope_categories') etc."
+
+# ------------------------------------------------------------------------------
+# 4. SSO CONFIGURATION (IAM-FR-002)
+# ------------------------------------------------------------------------------
+sso:
+  supported_protocols:
+    saml_2_0:
+      idp_metadata_url: "https://{enterprise_idp}/saml/metadata"
+      sp_entity_id: "https://api.scvri.io/saml/sp"
+      sp_acs_url: "https://api.scvri.io/api/v1/auth/saml/acs"
+      sp_slo_url: "https://api.scvri.io/api/v1/auth/saml/slo"
+      attribute_mappings:
+        email: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress
+        display_name: http://schemas.microsoft.com/identity/claims/displayname
+        groups: http://schemas.microsoft.com/ws/2008/06/identity/claims/groups
+      group_to_role_mapping:
+        SCVRI_EXEC: supply_chain_executive
+        SCVRI_MANAGER: supply_chain_manager
+        SCVRI_PROCUREMENT: procurement_officer
+        SCVRI_RISK: risk_analyst
+        SCVRI_COMPLIANCE: compliance_officer
+        SCVRI_IT: it_administrator
+      signature_algorithm: SHA-256
+      encryption: required
+
+    oidc:
+      issuer: "https://{enterprise_idp}"
+      client_id: stored_in_secrets_manager
+      scopes: [openid, profile, email, groups]
+      callback_url: "https://api.scvri.io/api/v1/auth/oidc/callback"
+      supported_idps: [Azure AD, Okta, Google Workspace, Ping Identity, Auth0, OneLogin]
+      pkce: required (S256)
+
+  jit_provisioning:
+    enabled: true
+    on_first_login:
+      - Auto-create core.users record
+      - Assign roles based on group_to_role_mapping
+      - If no group match → assign viewer role + notify it_administrator
+    subsequent_logins:
+      - Re-sync roles from IdP groups
+      - Update last_login_at
+
+  session_management:
+    access_token_ttl: 900s (15 minutes)
+    refresh_token_ttl: 604800s (7 days)
+    refresh_rotation: true (new refresh token on each use)
+    concurrent_sessions_max: 5
+    session_binding:
+      - device fingerprint (user-agent + ip hash)
+      - store in Redis with TTL = refresh_token_ttl
+    revocation:
+      - Logout → delete refresh token from Redis
+      - Force-revoke all → delete all Redis sessions for user_id
+      - Admin force-logout all → delete tenant's sessions in Redis pattern
+
+# ------------------------------------------------------------------------------
+# 5. MFA CONFIGURATION (IAM-FR-003)
+# ------------------------------------------------------------------------------
+mfa:
+  supported_factors:
+    totp:
+      standard: RFC 6238
+      algorithm: SHA1 (Google Authenticator compatible)
+      period: 30s
+      digits: 6
+      window: 1   # 1 step tolerance for clock drift
+      libraries: [pyotp]
+      qr_code_issuer: "SCVRI Platform"
+
+    fido2_webauthn:
+      spec: W3C WebAuthn Level 2
+      authenticators: [platform (TouchID/FaceID/Windows Hello), roaming (Yubikey)]
+      attestation: none (self-attestation accepted; direct for enterprise keys)
+      uvr: preferred   # User Verification Required
+      library: py_webauthn (FIDO Alliance)
+
+    backup_codes:
+      count: 10
+      format: "XXXX-XXXX"
+      storage: bcrypt hashed in core.users.mfa_backup_codes_hash
+      single_use: true
+      regeneration: invalidates all previous codes
+
+  enforcement:
+    global_policy: configurable per tenant (admin setting)
+    options:
+      - optional
+      - required_for_all
+      - required_for_roles: [supply_chain_executive, compliance_officer, it_administrator, risk_analyst]
+      - required_for_risky_actions: [risk_score_override, user_management_changes, api_key_creation]
+
+  mfa_challenge_flow:
+    step_1: POST /api/v1/auth/token with username/password → returns challenge_token if MFA enrolled
+    step_2: POST /api/v1/auth/mfa/verify with challenge_token + otp_code
+    step_3: Returns full JWT pair on success
+    note: "FIDO2 challenge uses WebAuthn assertion verification"
+
+# ------------------------------------------------------------------------------
+# 6. JWT SPECIFICATION
+# ------------------------------------------------------------------------------
+jwt:
+  algorithm: RS256
+  key_management:
+    signing_key: RSA 2048-bit in AWS KMS (auto-rotation every 90 days)
+    public_jwks_url: "https://api.scvri.io/.well-known/jwks.json"
+    kid: Key ID rotated with short overlap for zero-downtime key rotation
+
+  access_token_claims:
+    iss: "https://api.scvri.io"
+    sub: "{user_id}"
+    aud: "scvri-api"
+    exp: Now + 900
+    iat: Now
+    jti: uuid (for revocation)
+    tenant_id: uuid
+    roles: ["procurement_officer"]
+    user_type: "platform | supplier_portal"
+    supplier_id: uuid | null  # only for supplier_portal_user
+    scvri_scope:
+      categories: []
+      tiers: []
+      geos: []
+    mfa_verified: boolean
+    session_id: uuid
+
+  validation_rules:
+    - Verify RS256 signature against JWKS
+    - Check exp claim (reject if expired)
+    - Check iss + aud
+    - Check jti not in Redis revocation set
+    - Check session_id still active in Redis
+    - Reject if tenant.status != active
+
+# ------------------------------------------------------------------------------
+# 7. API ENDPOINTS
+# ------------------------------------------------------------------------------
+api_endpoints:
+  - POST /api/v1/auth/token         # Login (password, SSO assertion, refresh)
+  - POST /api/v1/auth/token/revoke  # Logout (revoke refresh token)
+  - GET  /api/v1/auth/saml/metadata # SP metadata XML
+  - POST /api/v1/auth/saml/acs      # SAML ACS endpoint
+  - GET  /api/v1/auth/oidc/login    # OIDC redirect
+  - GET  /api/v1/auth/oidc/callback # OIDC callback
+  - POST /api/v1/auth/mfa/enroll    # Initiate MFA enrollment
+  - POST /api/v1/auth/mfa/verify    # Verify MFA challenge
+  - DELETE /api/v1/auth/mfa         # Remove MFA device
+  - GET  /api/v1/admin/users
+  - POST /api/v1/admin/users
+  - GET  /api/v1/admin/users/{id}
+  - PUT  /api/v1/admin/users/{id}
+  - POST /api/v1/admin/users/{id}/lock
+  - POST /api/v1/admin/users/{id}/unlock
+  - POST /api/v1/admin/users/{id}/force-mfa
+  - POST /api/v1/admin/users/{id}/sessions/revoke-all
+  - GET  /api/v1/admin/roles
+  - GET  /api/v1/admin/audit-log
+  - POST /api/v1/admin/sso/saml     # Configure SAML IdP
+  - POST /api/v1/admin/sso/oidc     # Configure OIDC IdP
+  - GET  /api/v1/admin/api-keys
+  - POST /api/v1/admin/api-keys
+  - DELETE /api/v1/admin/api-keys/{id}
+  - GET  /api/v1/me                 # Current user profile + roles
+  - PUT  /api/v1/me/password        # Self-service password change
+
+# ------------------------------------------------------------------------------
+# 8. SECURITY HARDENING
+# ------------------------------------------------------------------------------
+security:
+  brute_force_protection:
+    failed_login_lockout_threshold: 10
+    lockout_duration: 30min
+    counter_storage: Redis, key=login_failures:{email}:{date}
+    ip_based_lockout: 50 failures / hour per IP
+
+  password_policy:
+    min_length: 12
+    require_uppercase: true
+    require_lowercase: true
+    require_digits: true
+    require_special: true
+    disallow_common: true (HaveIBeenPwned API check)
+    bcrypt_rounds: 12
+    password_history: 12 (cannot reuse last 12)
+    max_age_days: 90 for privileged roles (it_administrator, compliance_officer)
+
+  api_keys:
+    format: "scvri_{version}_{random_64_hex}"
+    storage: SHA-256 hashed in DB (never stored plaintext)
+    scopes: limited subset of user permissions applied at creation
+    expiry: required at creation (max 365 days)
+
+  audit_trail:
+    logged_events:
+      - login_success / login_failure
+      - token_issued / token_revoked
+      - mfa_enrolled / mfa_bypassed / mfa_failed
+      - password_changed / password_reset
+      - user_created / user_locked / user_deactivated
+      - role_assigned / role_removed
+      - sso_configured
+      - api_key_created / api_key_revoked
+      - permission_denied
+    storage: audit.audit_log (immutable, partitioned quarterly)
+    retention: 7 years (SOC 2 + ISO 27001)
+
+# ------------------------------------------------------------------------------
+# 9. SRS TRACEABILITY
+# ------------------------------------------------------------------------------
+srs_traceability:
+  - {srs_id: IAM-FR-001, implemented_by: "8 roles, permission matrix, user lifecycle CRUD"}
+  - {srs_id: IAM-FR-002, implemented_by: "SAML 2.0 + OIDC SSO, JIT provisioning, group mapping"}
+  - {srs_id: IAM-FR-003, implemented_by: "TOTP + FIDO2/WebAuthn + backup codes + enforcement policies"}
+  - {srs_id: IAM-FR-004, implemented_by: "data_scoping dimensions + JWT scope claims + RLS enforcement"}
+  - {srs_id: IAM-FR-005, implemented_by: "audit trail: all auth events → audit.audit_log immutable"}
+  - {srs_id: IAM-FR-006, implemented_by: "supplier_portal_user role + isolated JWT + RLS policy"}
+  - {srs_id: NFR-SEC-003, implemented_by: "bcrypt-12 passwords, RSA-2048 JWT, AES-256 storage"}
+  - {srs_id: NFR-SEC-004, implemented_by: "MFA enforcement, FIDO2 hardware key support"}
+  - {srs_id: NFR-SEC-005, implemented_by: "brute force rate limiting, account lockout, IP throttle"}

@@ -1,0 +1,541 @@
+##############################################################################
+# MODULE 17 — OPERATIONAL RUNBOOKS
+# SCVRI Platform — Production Operations
+# Version: 1.0.0
+##############################################################################
+
+metadata:
+  platform: SCVRI
+  maintained_by: SRE Team
+  review_cycle: quarterly
+  war_room_bridge: "+1-800-SCVRI-P1"
+  slack_channels:
+    p1_incidents: "#scvri-p1-war-room"
+    p2_incidents: "#scvri-p2-incidents"
+    deployments: "#scvri-deployments"
+  pagerduty:
+    p1_service: SCVRI-P1
+    p2_service: SCVRI-P2
+    escalation_policy: SCVRI-Escalation-V2
+  on_call_rotation:
+    tool: PagerDuty
+    teams:
+      - name: SRE Primary
+        schedule_id: SSCVRI01
+        rotation: weekly (Mon 09:00 UTC)
+      - name: SRE Secondary
+        schedule_id: SSCVRI02
+        rotation: weekly (Mon 09:00 UTC) offset by 3 days
+      - name: Platform Eng Escalation
+        schedule_id: SSCVRI03
+        rotation: bi-weekly (for P1 escalation only)
+    contacts:
+      sre_lead: "sre-lead@company.com / PD: USRE001"
+      platform_eng_lead: "platform-eng@company.com / PD: UPEN001"
+      security_on_call: "security@company.com / PD: USEC001"
+      aws_tam: "AWS Support Console → Enterprise TAM"
+
+# ==============================================================================
+# RUNBOOK 1 — P1 INCIDENT: PLATFORM DOWN / API UNAVAILABLE
+# ==============================================================================
+runbooks:
+  - id: RB-001
+    title: "P1 Incident — Platform Completely Down or API Unavailable"
+    trigger_conditions:
+      - "Kong health check returns 5xx for > 2 minutes"
+      - "Overall error rate > 50% for > 2 minutes"
+      - "All pods in critical namespace CrashLoopBackOff"
+      - "PagerDuty P1 alert fired (auto from Prometheus alertmanager)"
+    severity: P1
+    max_ttd: 15min   # time to detect (covered by alerting)
+    max_ttr: 4h      # time to restore per SLA
+
+    steps:
+      1_acknowledge:
+        action: "Acknowledge PagerDuty alert immediately"
+        who: On-call SRE
+        time_budget: 5min
+        command: "pagerduty-cli ack --incident={incident_id}"
+
+      2_assess_blast_radius:
+        action: "Determine scope: all tenants vs subset"
+        commands:
+          - "kubectl get pods -n scvri-prod --field-selector=status.phase!=Running"
+          - "kubectl top nodes"
+          - "curl -s https://api.scvri.io/health/ready | jq ."
+        expected_output: "List of failing pods + node resource utilisation"
+
+      3_check_kong_gateway:
+        action: "Verify Kong is healthy"
+        commands:
+          - "kubectl get pods -n kong -l app=ingress-kong"
+          - "kubectl logs -n kong -l app=ingress-kong --tail=100 | grep ERROR"
+          - "curl -s http://kong-admin.kong.svc.cluster.local:8001/status"
+        if_failing: "Restart Kong pods → kubectl rollout restart deployment/kong -n kong"
+
+      4_check_rds:
+        action: "Verify RDS Aurora primary is available"
+        commands:
+          - "aws rds describe-db-clusters --db-cluster-identifier scvri-prod-aurora-pg | jq '.DBClusters[0].Status'"
+          - "aws rds describe-db-instances | jq '.DBInstances[] | select(.DBClusterIdentifier==\"scvri-prod-aurora-pg\") | {id:.DBInstanceIdentifier, role:.DBClusterStatus, status:.DBInstanceStatus}'"
+        if_failing: "Execute RB-004 (RDS Failover Runbook)"
+
+      5_check_service_pods:
+        action: "Identify CrashLoopBackOff or ImagePullBackOff pods"
+        commands:
+          - "kubectl get pods -n scvri-prod | grep -v Running | grep -v Completed"
+          - "kubectl describe pod {failing_pod} -n scvri-prod | tail -30"
+          - "kubectl logs {failing_pod} -n scvri-prod --previous | tail -50"
+        common_fixes:
+          OOMKilled: "Increase memory limit → kubectl set resources deployment/{name} --limits=memory=2Gi -n scvri-prod"
+          CrashLoopBackOff: "Check logs; if bad deploy → execute rollback (step 6)"
+          ImagePullBackOff: "Check ECR auth → kubectl create secret docker-registry ecr-secret ..."
+
+      6_rollback_if_recent_deploy:
+        action: "If incident started within 30 min of a deployment, rollback immediately"
+        commands:
+          - "argocd app history scvri-prod --output yaml | head -40"
+          - "argocd app rollback scvri-prod {prev_sync_id}"
+          - "watch kubectl rollout status deployment/{service} -n scvri-prod"
+        assertion: "Rollout completes < 5min; error rate drops to < 1%"
+
+      7_communicate:
+        action: "Post status update every 15 minutes"
+        channels: ["#scvri-p1-war-room", "status.scvri.io (Statuspage)"]
+        template: |
+          "We are investigating an issue affecting SCVRI platform availability.
+          Impact: {describe impact}. Estimated resolution: {ETA}.
+          Last update: {timestamp}"
+
+      8_escalate:
+        conditions:
+          - "No progress after 60 minutes → escalate to Platform Eng Lead"
+          - "RDS or MSK failure → engage AWS TAM (Enterprise Support)"
+          - "Security event suspected → engage Security On-Call"
+        command: "pagerduty-cli escalate --incident={id} --escalation-policy=SCVRI-Escalation-V2"
+
+      9_postmortem:
+        action: "Within 24h of resolution, create postmortem doc"
+        template: "docs/postmortems/YYYY-MM-DD-{incident_id}.md"
+        sections: [Timeline, Root Cause, Impact, Mitigations, Action Items (owner + due date)]
+
+# ==============================================================================
+# RUNBOOK 2 — P2 INCIDENT: SINGLE SERVICE DEGRADED
+# ==============================================================================
+  - id: RB-002
+    title: "P2 Incident — Single Service Degraded or Slow"
+    trigger_conditions:
+      - "P95 latency for one service > 2× baseline for > 5 minutes"
+      - "Error rate for one service > 5% for > 5 minutes"
+      - "HPA at max replicas with CPU > 90%"
+
+    steps:
+      1_identify_service:
+        commands:
+          - "kubectl top pods -n scvri-prod | sort -k3 -rn"
+          - "kubectl get hpa -n scvri-prod"
+          - "Open Grafana → SCVRI Services dashboard → filter by service"
+
+      2_scale_out_if_cpu:
+        action: "Temporarily increase HPA max replicas if CPU-bound"
+        command: "kubectl patch hpa {service}-hpa -n scvri-prod -p '{\"spec\":{\"maxReplicas\":40}}'"
+        note: "Revert to original max within 2h or after incident closes"
+
+      3_check_upstream_dependencies:
+        services:
+          visibility_service: [RDS, Redis, Kafka]
+          risk_intelligence: [RDS, Redis, external-feeds]
+          alert_engine: [RDS, Redis, Kafka, SES/SNS/Slack]
+        commands:
+          - "kubectl exec -n scvri-prod -it {pod} -- python -c \"import redis; r=redis.from_url('{}'); print(r.ping())\""
+          - "kubectl exec -n scvri-prod -it {pod} -- pg_isready -h {rds_writer_endpoint}"
+
+      4_check_circuit_breakers:
+        action: "Check if circuit breakers for external feeds are open"
+        command: "kubectl exec -n scvri-prod -it {risk-pod} -- curl http://localhost:8080/internal/circuit-breaker/status | jq ."
+        if_open: "Feeds will retry automatically; check feed vendor status pages"
+
+      5_drain_and_restart:
+        action: "If OOM or memory leak suspected, rolling restart"
+        command: "kubectl rollout restart deployment/{service} -n scvri-prod"
+
+      6_resolution:
+        sla: "P2 must be resolved within 4h or escalated to P1"
+
+# ==============================================================================
+# RUNBOOK 3 — DATABASE FAILOVER (RDS AURORA)
+# ==============================================================================
+  - id: RB-004
+    title: "RDS Aurora PostgreSQL Failover"
+    trigger: "Aurora primary instance failure / planned maintenance"
+
+    steps:
+      1_detect:
+        commands:
+          - "aws rds describe-events --source-identifier scvri-prod-aurora-pg --duration 60"
+          - "aws cloudwatch get-metric-statistics --namespace AWS/RDS --metric-name DatabaseConnections ..."
+        expected: "Aurora failover event visible in events within 30s"
+
+      2_rds_proxy_reroute:
+        automatic: true
+        description: |
+          RDS Proxy automatically reroutes connections to new writer within 30s.
+          Application connections are reused from the proxy pool.
+          No application config change required.
+
+      3_verify_new_writer:
+        commands:
+          - "aws rds describe-db-clusters --db-cluster-identifier scvri-prod-aurora-pg | jq '.DBClusters[0] | {status:.Status, members:.DBClusterMembers}'"
+          # Expected: previous reader promoted to writer; old writer shows as reader
+          - "psql \"{rds_proxy_endpoint}\" -U scvri_admin -c \"SELECT pg_is_in_recovery();\""
+          # Expected: f (false = this is the new writer)
+
+      4_drain_hung_connections:
+        action: "Kill hung sessions if application is stuck"
+        sql: |
+          SELECT pg_terminate_backend(pid)
+          FROM pg_stat_activity
+          WHERE datname = 'scvri'
+            AND state = 'idle in transaction'
+            AND state_change < now() - interval '5 minutes';
+
+      5_verify_application:
+        commands:
+          - "kubectl rollout restart deployment -n scvri-prod"   # force fresh connections
+          - "curl -s https://api.scvri.io/health/ready | jq ."
+        assertion: "All /health/ready checks return HTTP 200"
+
+      6_add_replacement_reader:
+        action: "AWS auto-heals reader within 5 minutes; verify within 15 minutes"
+        command: "aws rds describe-db-instances | jq '[.DBInstances[] | select(.DBClusterIdentifier==\"scvri-prod-aurora-pg\")]'"
+        expected: "3 instances (1 writer + 2 readers) all status=available"
+
+# ==============================================================================
+# RUNBOOK 5 — KAFKA BROKER FAILURE (MSK)
+# ==============================================================================
+  - id: RB-005
+    title: "Kafka Broker Failure (MSK)"
+    trigger: "1 or more MSK broker instances terminated / unreachable"
+
+    steps:
+      1_detect:
+        commands:
+          - "aws kafka list-nodes --cluster-arn {msk_cluster_arn} | jq '.NodeInfoList[] | {id:.BrokerNodeInfo.BrokerId, state:.CurrentBrokerSoftwareInfo}'"
+          - "Check Grafana → Kafka dashboard → UnderReplicatedPartitions metric"
+        alert_name: "KafkaUnderReplicatedPartitions"
+        concern_threshold: 0   # target is always 0
+
+      2_assess_capacity:
+        note: |
+          Cluster has 6 brokers with RF=3. Up to 1 broker failure = no availability impact.
+          2 broker failures = reduced throughput but no message loss (min.insync.replicas=2).
+          3+ broker failures = STOP automated recovery; escalate to AWS TAM immediately.
+        command: "aws kafka describe-cluster --cluster-arn {arn} | jq '.ClusterInfo.BrokerNodeGroupInfo'"
+
+      3_wait_for_broker_replacement:
+        when: "1-2 broker failure"
+        action: |
+          MSK automatically replaces failed brokers within 15-30 minutes.
+          Monitor: aws kafka describe-cluster --cluster-arn {arn}
+          Wait for all brokers to return to ACTIVE state.
+
+      4_rebalance_partitions:
+        action: "After brokers back online, trigger preferred leader election"
+        command: |
+          kubectl exec -n kafka-tools -it kafka-tools -- \
+            kafka-leader-election.sh --bootstrap-server {msk_bootstrap} \
+            --election-type PREFERRED \
+            --all-topic-partitions
+
+      5_check_consumer_lag:
+        command: |
+          kubectl exec -n kafka-tools -it kafka-tools -- \
+            kafka-consumer-groups.sh --bootstrap-server {msk_bootstrap} \
+            --all-groups --describe | grep "LAG" | sort -k6 -rn | head -20
+        action: "Any consumer group with LAG > 100,000 → scale up consumer replicas"
+
+      6_verify:
+        commands:
+          - "Grafana → Kafka dashboard → UnderReplicatedPartitions = 0"
+          - "Grafana → Kafka dashboard → ActiveControllerCount = 1"
+
+# ==============================================================================
+# RUNBOOK 6 — REDIS FAILOVER (ELASTICACHE)
+# ==============================================================================
+  - id: RB-006
+    title: "Redis Cluster Shard Failure (ElastiCache)"
+    trigger: "ElastiCache primary node failure in one or more shards"
+
+    steps:
+      1_detect:
+        commands:
+          - "aws elasticache describe-replication-groups --replication-group-id scvri-prod-redis | jq '.ReplicationGroups[0].NodeGroups[] | {shard:.NodeGroupId, status:.Status, members:.NodeGroupMembers}'"
+          # Expected: all statuses = available
+
+      2_automatic_failover:
+        note: |
+          ElastiCache automatic failover is ENABLED. Primary failure triggers replica
+          promotion within < 60s. Application Redis connections will throw transient errors
+          during the 10-30s slot migration window.
+
+      3_handle_application_errors:
+        note: "All services use connection retry with exponential backoff (max 5 retries, 2s base)"
+        check: |
+          kubectl logs -n scvri-prod -l app=visibility-service --tail=200 \
+          | grep -i "redis\|cache"
+        expected: "Short burst of RedisConnectionError logs followed by recovery"
+
+      4_verify_shard_recovery:
+        command: |
+          aws elasticache describe-replication-groups \
+            --replication-group-id scvri-prod-redis \
+            | jq '.ReplicationGroups[0].NodeGroups[] | select(.Status != "available")'
+        expected: "Empty output (all shards available)"
+
+      5_repopulate_critical_cache:
+        action: "Force cache warm-up for critical keys after prolonged failure"
+        commands:
+          - "curl -X POST https://api.scvri.io/internal/cache/warm -H 'Authorization: Bearer {admin_token}'"
+          # Endpoint: triggers background Celery task populating top-1000 supplier risk score cache
+
+# ==============================================================================
+# RUNBOOK 7 — ML MODEL ROLLBACK
+# ==============================================================================
+  - id: RB-007
+    title: "ML Model Emergency Rollback"
+    trigger_conditions:
+      - "PagerDuty alert: MLModelDrift (PSI > 0.25)"
+      - "PagerDuty alert: MLModelAUCDrop (AUC-ROC drops > 0.05 vs baseline)"
+      - "Manual escalation from ml_lead or risk_analyst"
+
+    steps:
+      1_identify_bad_model:
+        commands:
+          - "kubectl get seldondeployments -n scvri-ml | jq ."
+          - "mlflow runs search --experiment-id {exp_id} --filter 'tags.stage = \"Production\"'"
+
+      2_rollback_seldon_deployment:
+        action: "Switch Seldon deployment to previous stable model version"
+        commands:
+          - |
+            # Get current production model URI
+            CURRENT=$(mlflow models list -n composite-risk-scorer --stage Production | head -2 | tail -1 | awk '{print $NF}')
+            PREVIOUS=$(mlflow models list -n composite-risk-scorer --stage Archived | head -2 | tail -1 | awk '{print $NF}')
+            echo "Rolling back from $CURRENT to $PREVIOUS"
+          - |
+            kubectl patch seldondeployment composite-risk-scorer -n scvri-ml \
+              --type='json' \
+              -p='[{"op":"replace","path":"/spec/predictors/0/graph/modelUri","value":"s3://scvri-ml-artifacts-prod/models/{previous_run_id}/artifacts/model"}]'
+          - "kubectl rollout status deployment/composite-risk-scorer -n scvri-ml"
+
+      3_verify_rollback:
+        commands:
+          - "curl -X POST http://composite-risk-scorer.scvri-ml.svc.cluster.local:9000/api/v1.0/predictions -d '{\"data\":{\"ndarray\":[[{sample_features}]]}}'"
+          # Expected: successful inference response
+          - "Check Grafana → ML dashboard → model prediction latencies normalised"
+
+      4_archive_bad_model:
+        command: "mlflow models transition-to-stage --name composite-risk-scorer --version {bad_version} --stage Archived"
+
+      5_postmortem:
+        action: "File within 48h. Root cause analysis of drift source."
+        file: "docs/postmortems/ml-rollback-{date}.md"
+
+# ==============================================================================
+# RUNBOOK 8 — GDPR ERASURE SLA ESCALATION (MISSED 30-DAY WINDOW)
+# ==============================================================================
+  - id: RB-008
+    title: "GDPR Erasure Request — SLA Breach Escalation"
+    trigger: "erasure_requests.sla_deadline < NOW() AND status != 'completed'"
+    detection: "Celery Beat job gdpr_sla_monitor runs daily at 06:00 UTC"
+
+    steps:
+      1_identify_overdue_requests:
+        sql: |
+          SELECT id, data_subject_email, sla_deadline, status, created_at
+          FROM compliance.erasure_requests
+          WHERE sla_deadline < NOW()
+            AND status NOT IN ('completed', 'partially_completed')
+          ORDER BY sla_deadline ASC;
+
+      2_escalate_immediately:
+        who: "Compliance Officer + Data Protection Officer (DPO)"
+        channel: "#scvri-compliance"
+        action: "Open GDPR compliance incident ticket (Jira → GDPR board)"
+        sla_impact: "Regulators may require notification if breach caused harm to data subject"
+
+      3_execute_erasure_manually:
+        commands:
+          - |
+            # Run erasure worker for specific request with verbose logging
+            celery -A scvri.celery call compliance.tasks.execute_gdpr_erasure \
+              --args='["{erasure_request_id}"]' \
+              --kwargs='{"force":true,"notify_subject":true}'
+          - "Monitor Celery Flower dashboard for task completion"
+
+      4_verify_erasure:
+        sql: |
+          -- Verify user email replaced
+          SELECT email FROM auth.users WHERE id = '{data_subject_user_id}';
+          -- Expected: erased_{user_id}@erased.invalid
+
+          -- Verify audit trail pseudonymised (not deleted)
+          SELECT COUNT(*) FROM audit.audit_log WHERE actor_id = '{data_subject_user_id}';
+          -- Expected: rows present but actor_email = 'pseudonymised'
+
+      5_notify_supervisory_authority:
+        when: "Breach exceeds 30 days with actual harm risk to data subject"
+        procedure: |
+          Per GDPR Art. 33 — notify supervisory authority within 72h of becoming aware of breach.
+          Contact: DPO → submit via national SA portal (UK ICO / Germany BfDI / etc.)
+        documentation: "Incident file must include: reason for delay, steps taken, remediation"
+
+      6_close_request:
+        sql: |
+          UPDATE compliance.erasure_requests
+          SET status = 'completed',
+              completed_at = NOW(),
+              notes = 'Manually escalated and completed due to SLA breach. See incident {ticket_id}.'
+          WHERE id = '{erasure_request_id}';
+
+# ==============================================================================
+# RUNBOOK 9 — DISASTER RECOVERY ACTIVATION (eu-west-1)
+# ==============================================================================
+  - id: RB-009
+    title: "DR Activation — Failover to eu-west-1"
+    trigger: |
+      us-east-1 region-wide outage OR catastrophic data corruption
+      affecting all production services. Activated ONLY by SRE Lead + Platform Eng Lead jointly.
+    rpo_target: 15min
+    rto_target: 4h
+
+    steps:
+      1_declare_dr:
+        who: "SRE Lead + CTO"
+        action: "Declare DR event in PagerDuty; notify all stakeholders"
+        channels: ["#scvri-p1-war-room", "status.scvri.io (major outage)", "email blast"]
+
+      2_verify_dr_rds:
+        action: "Promote Aurora Global Database secondary cluster in eu-west-1"
+        commands:
+          - "aws rds remove-from-global-cluster --global-cluster-identifier scvri-global-cluster --db-cluster-identifier scvri-dr-aurora-pg --region eu-west-1"
+          # ^^ Detaches secondary and promotes it to standalone writer
+          - "aws rds describe-db-clusters --db-cluster-identifier scvri-dr-aurora-pg --region eu-west-1 | jq '.DBClusters[0].Status'"
+          # Expected: available (within 1-2 minutes)
+        rpo_note: "Aurora Global Database replication lag < 1s → RPO ~1s for DB"
+
+      3_verify_dr_msk:
+        action: "MSK in eu-west-1 has mirror via MirrorMaker 2. Verify consumer offsets."
+        commands:
+          - "aws kafka list-clusters --region eu-west-1 | jq '.ClusterInfoList[] | select(.ClusterName==\"scvri-dr-msk\") | .State'"
+          # Expected: ACTIVE
+          - "Check MirrorMaker2 lag < target (should be < 60s under normal conditions)"
+
+      4_eks_dr_cluster:
+        action: "EKS DR cluster in eu-west-1 is pre-provisioned (0 nodes, node group min=0)"
+        commands:
+          - "eksctl scale nodegroup --cluster scvri-dr-eks --name application --nodes-min=3 --nodes=6 --region eu-west-1"
+          - "eksctl scale nodegroup --cluster scvri-dr-eks --name system --nodes-min=3 --nodes=3 --region eu-west-1"
+          - "watch kubectl get nodes --context=scvri-dr-eks"
+          # Expected: nodes Ready within 5-7 minutes
+
+      5_argocd_sync_dr:
+        action: "ArgoCD in DR context points to eu-west-1 EKS, uses DR environment values"
+        commands:
+          - "argocd app sync scvri-dr --context scvri-dr --revision main --prune"
+          - "watch argocd app get scvri-dr --context scvri-dr"
+          # Expected: Synced + Healthy within 10-15 minutes
+
+      6_dns_cutover:
+        action: "Update Route53 CNAME records to DR ALB"
+        commands:
+          - |
+            DR_ALB=$(kubectl get svc -n kong -l app=ingress-kong --context=scvri-dr-eks \
+              -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+            aws route53 change-resource-record-sets \
+              --hosted-zone-id {HOSTED_ZONE_ID} \
+              --change-batch '{
+                "Changes": [{
+                  "Action": "UPSERT",
+                  "ResourceRecordSet": {
+                    "Name": "api.scvri.io",
+                    "Type": "CNAME",
+                    "TTL": 60,
+                    "ResourceRecords": [{"Value": "'$DR_ALB'"}]
+                  }
+                }]
+              }'
+          - "# Wait for TTL to propagate (60s with low pre-set TTL)"
+
+      7_smoke_test_dr:
+        commands:
+          - "curl -s https://api.scvri.io/health/ready | jq ."
+          # Expected: {"status":"ok","region":"eu-west-1"}
+          - "Run E2E smoke test suite against DR"
+
+      8_communicate_status:
+        action: |
+          Update status.scvri.io with:
+          "DR is now active. Platform is operating from EU (eu-west-1).
+          Data in EU region is complete with < 1s RPO. RTO target = 4h achieved."
+
+      9_recovery_after_us_east_1_restores:
+        action: |
+          When us-east-1 is healthy again:
+          1. Re-establish Aurora Global Database with eu-west-1 as new primary
+          2. Sync data back to us-east-1 replica
+          3. Plan failback window (preferably during low-traffic period)
+          4. Reverse DNS cutover
+
+# ==============================================================================
+# RUNBOOK 10 — BACKUP VERIFICATION & RESTORE PROCEDURES
+# ==============================================================================
+  - id: RB-010
+    title: "Backup Verification & Point-In-Time Restore"
+    schedule: "Monthly verification (automated), on-demand restore on request"
+
+    backup_inventory:
+      rds_aurora:
+        automated_backup: "14-day retention, continuous transaction log (PITR to any second)"
+        snapshots: "Manual pre-release snapshots retained 35 days"
+        cross_region: "Automated snapshot copy to eu-west-1 (1-day lag max)"
+
+      kafka_msk:
+        retention: "7-day log retention per topic (configurable per topic)"
+        s3_sink: "All topics archived to s3://scvri-audit-archive-prod/kafka/ via Kafka Connect S3 Sink"
+
+      redis:
+        rdb_snapshots: "Every 5 minutes (latest 5 snapshots)"
+        aof: "appendonly yes (every second fsync)"
+
+      s3_supplier_docs:
+        versioning: enabled
+        object_lock: "COMPLIANCE mode, 7-year retention"
+        cross_region_replication: "s3://scvri-supplier-docs-eu-west-1-dr"
+
+    restore_procedures:
+      rds_pitr:
+        steps:
+          1: "Identify target restore time: aws rds describe-db-clusters | jq '.DBClusters[0].EarliestRestorableTime,.LatestRestorableTime'"
+          2: |
+            aws rds restore-db-cluster-to-point-in-time \
+              --source-db-cluster-identifier scvri-prod-aurora-pg \
+              --db-cluster-identifier scvri-restore-{timestamp} \
+              --restore-to-time {ISO8601_TIMESTAMP} \
+              --vpc-security-group-ids {sg_ids} \
+              --db-subnet-group-name {subnet_group}
+          3: "Add DB instance to restored cluster (db.r6g.4xlarge)"
+          4: "Point RDS Proxy to restored cluster endpoint"
+          5: "Verify data consistency via row count queries"
+          6: "If restoring for investigation: create read-only access only"
+
+      kafka_topic_replay:
+        steps:
+          1: "Identify target offset/timestamp: kafka-consumer-groups.sh --describe"
+          2: "Set consumer group offset: kafka-consumer-groups.sh --reset-offsets --to-datetime {ISO8601}"
+          3: "Restart affected consumers"
+
+      s3_versioned_restore:
+        steps:
+          1: "aws s3api list-object-versions --bucket scvri-supplier-docs-prod --prefix {supplier_id}/"
+          2: "aws s3api get-object --bucket scvri-supplier-docs-prod --key {key} --version-id {version_id} {output_file}"

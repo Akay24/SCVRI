@@ -1,0 +1,32 @@
+name: CI — Integration Layer
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "services/integration/**"
+      - "shared/**"
+      - ".github/workflows/ci-integration.yml"
+      - ".github/workflows/_reusable-service-ci.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "services/integration/**"
+      - "shared/**"
+      - ".github/workflows/ci-integration.yml"
+      - ".github/workflows/_reusable-service-ci.yml"
+
+concurrency:
+  group: ci-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: ./.github/workflows/_reusable-service-ci.yml
+    with:
+      service-name: integration
+      service-path: services/integration
+      image-name: ghcr.io/scvri/integration
+      push-image: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    secrets:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}

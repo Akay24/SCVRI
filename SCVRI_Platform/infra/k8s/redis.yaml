@@ -1,0 +1,133 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Redis 7 — single-node (promote to Sentinel or Cluster for HA)
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: scvri-platform
+data:
+  redis.conf: |
+    requirepass ${REDIS_PASSWORD}
+    maxmemory 2gb
+    maxmemory-policy allkeys-lru
+    save 900 1
+    save 300 10
+    save 60 10000
+    appendonly yes
+    appendfsync everysec
+    tcp-keepalive 60
+    timeout 300
+    loglevel notice
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-master
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: scvri-platform
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+      name: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: scvri-platform
+    app.kubernetes.io/version: "7"
+spec:
+  serviceName: redis-master
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/part-of: scvri-platform
+    spec:
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+        runAsNonRoot: true
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+              name: redis
+          command:
+            - sh
+            - -c
+            - |
+              # Substitute password at runtime from env then exec redis-server
+              sed "s/\${REDIS_PASSWORD}/$REDIS_PASSWORD/g" /etc/redis/redis.conf \
+                > /tmp/redis-runtime.conf
+              exec redis-server /tmp/redis-runtime.conf
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: scvri-redis-secret
+                  key: REDIS_PASSWORD
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "3Gi"
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+            - name: redis-config
+              mountPath: /etc/redis
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" ping | grep -q PONG
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" ping | grep -q PONG
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: redis-config
+          configMap:
+            name: redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+        labels:
+          app.kubernetes.io/name: redis
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 20Gi

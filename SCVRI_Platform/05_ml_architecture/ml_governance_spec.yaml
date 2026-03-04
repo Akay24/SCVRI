@@ -1,0 +1,363 @@
+##############################################################################
+# MODULE 10 — ML ARCHITECTURE & MODEL GOVERNANCE SPECIFICATION
+# SRS Coverage: RISK-FR-001, RISK-FR-002 (models), NFR-ML-001..004
+# Version: 1.0.0
+##############################################################################
+
+ml_governance:
+  description: "Full ML lifecycle management for SCVRI's 3 production models."
+  mlflow_tracking_server: "http://mlflow.scvri-infra.svc.cluster.local:5000"
+  model_registry: MLflow Model Registry (PostgreSQL backend)
+  artifact_store: "s3://scvri-ml-artifacts-prod/"
+  serving_platform: Seldon Core 1.17 (EKS)
+  gpu_nodes: g4dn.xlarge (NVIDIA T4) — dedicated node pool for NLP inference
+
+# ------------------------------------------------------------------------------
+# 1. MODEL INVENTORY
+# ------------------------------------------------------------------------------
+models:
+  - model_id: scvri-composite-risk-scorer
+    version: "1.0.0"
+    type: Ensemble (XGBoost 2.0 + TabNet)
+    task: regression (composite risk score 0-100) + classification (critical/high/medium/low)
+    target: composite_risk_score
+    srs_requirement: RISK-FR-001, RISK-FR-002
+
+    training:
+      data_source: risk.supplier_risk_scores (historical) + 15 external feeds (feature matrix)
+      feature_count: 87
+      feature_dimensions: [financial(9), operational(9), geopolitical(7), esg(7), concentration(5), cyber(4), natural_hazard(5), derived(41)]
+      min_training_observations: 50_000
+      train_test_split: 80/10/10 (train/val/test)
+      class_imbalance_handling: "SMOTE-NC for critical-risk class (typically <5% of suppliers)"
+      hyperparameter_tuning: Optuna 3.x (100 trials, TPE sampler)
+      training_infrastructure: SageMaker Training Job (ml.m5.4xlarge × 4)
+
+    xgboost_config:
+      n_estimators: 1000
+      max_depth: 6
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      objective: "reg:squarederror"
+      early_stopping_rounds: 50
+      eval_metric: rmse
+
+    tabnet_config:
+      n_d: 64
+      n_a: 64
+      n_steps: 5
+      gamma: 1.5
+      lambda_sparse: 1e-3
+      optimizer: Adam(lr=2e-3)
+      batch_size: 2048
+      virtual_batch_size: 256
+
+    ensemble:
+      method: weighted_average
+      xgboost_weight: 0.6
+      tabnet_weight: 0.4
+      uncertainty_estimate: "Bootstrap-100 ensemble variance → confidence interval"
+
+    performance_targets:
+      auc_roc: ">= 0.85"
+      mae: "<= 5.0 (score points)"
+      high_risk_precision: ">= 0.80"
+      high_risk_recall: ">= 0.75"
+      shap_inference_latency: "< 100ms per supplier"
+
+    explainability:
+      method: SHAP TreeExplainer
+      per_prediction_outputs:
+        - top_5_contributing_features with shap_value + natural language description
+        - waterfall_chart_data (serialized for UI rendering)
+        - force_plot_data
+      global_importance: Computed weekly, stored in S3, displayed on model dashboard
+      library: shap 0.44
+
+    bias_monitoring:
+      protected_attributes: [country_code, industry_sector]
+      metrics:
+        - demographic_parity_difference: "Alert if > 0.10"
+        - equalized_odds_difference: "Alert if > 0.15"
+      compute_schedule: nightly
+      report_access: compliance_officer + ml_lead roles
+
+    drift_detection:
+      feature_drift:
+        method: Population Stability Index (PSI)
+        threshold_warning: 0.10
+        threshold_critical: 0.20
+        frequency: daily
+        implementation: evidently AI 0.4
+      prediction_drift:
+        method: KS test (Kolmogorov-Smirnov)
+        threshold_p_value: 0.05
+        frequency: daily
+      action_on_critical_drift:
+        - PagerDuty alert to ml_lead
+        - Auto-rollback if AUC-ROC drops > 0.05 below baseline on validation slice
+        - Trigger emergency retraining pipeline
+
+    retraining:
+      schedule: weekly (Sunday 02:00 UTC)
+      trigger_conditions:
+        - scheduled_weekly: always
+        - drift_critical: immediate trigger
+        - performance_degradation: AUC-ROC < 0.82 on rolling 7-day eval
+      pipeline: SageMaker Pipeline (scvri-risk-scoring-retrain)
+      stages:
+        - feature_extraction
+        - data_validation (Great Expectations)
+        - model_training
+        - model_evaluation (validation split)
+        - explainability_computation
+        - bias_evaluation
+        - model_registration_mlflow
+        - canary_deployment_5pct
+        - shadowing_24h
+        - full_promotion_if_pass
+
+  - model_id: scvri-nlp-intelligence-pipeline
+    version: "1.0.0"
+    type: BERT fine-tuned (bert-base-multilingual-cased)
+    task: multi-label text classification + NER + severity regression
+    input: news_headline + article_body (max 512 tokens)
+    output: risk_labels[], entity_list[], severity_score(0-1)
+    srs_requirement: RISK-FR-003 (external intelligence NLP)
+    serving: Torchserve 0.9 (GPU: NVIDIA T4)
+
+    labels:
+      - financial_distress
+      - operational_disruption
+      - geopolitical_event
+      - natural_disaster
+      - esg_controversy
+      - regulatory_action
+
+    ner_entities: [ORGANIZATION, LOCATION, PRODUCT, REGULATION, SANCTION]
+
+    training:
+      base_model: bert-base-multilingual-cased (Hugging Face)
+      fine_tuning_data: "25,000 labeled supply chain news articles (internal + synthetic)"
+      languages: [en, de, fr, zh, ja, es, pt]
+      optimizer: AdamW(lr=2e-5, weight_decay=0.01)
+      epochs: 5 (early stopping on val F1)
+      batch_size: 32
+      gradient_accumulation_steps: 4
+      mixed_precision: fp16 (NVIDIA T4)
+
+    performance_targets:
+      classification_f1_macro: ">= 0.80"
+      ner_f1: ">= 0.78"
+      inference_p95: "< 2s for {headline + 512-token body}"
+      gpu_throughput: "32 articles/batch in < 1.5s on T4"
+
+    entity_matching:
+      description: "Match extracted ORGANIZATIONs to supply.suppliers using fuzzy string matching"
+      method: rapidfuzz (token_sort_ratio >= 80) + DUNS cross-reference
+      false_positive_mitigation: "Require LOCATION or REGULATION co-occurrence for financial_distress label"
+
+  - model_id: scvri-predictive-forecaster
+    version: "1.0.0"
+    type: Bidirectional LSTM + Prophet ensemble
+    task: time-series regression (risk score forecast horizons 30/90 days)
+    srs_requirement: RISK-FR-008 (risk trend + forecast)
+    serving: CPU inference (FastAPI endpoint within risk-intelligence-service)
+
+    lstm_config:
+      architecture: 2-layer BiLSTM
+      hidden_units: [128, 64]
+      dropout: 0.2
+      lookback_window: 90  # days
+      features_per_timestep: 15  # rolling risk dimensions + macro signals
+      optimizer: Adam(lr=1e-3)
+      loss: Huber
+      batch_size: 512
+
+    prophet_config:
+      changepoint_prior_scale: 0.05
+      seasonality_mode: multiplicative
+      weekly_seasonality: true
+      yearly_seasonality: true
+      interval_width: 0.90   # 90% confidence interval
+
+    ensemble:
+      method: median ensemble (median of LSTM point + Prophet point at each horizon)
+      confidence_interval: "90% CI from LSTM variance + Prophet interval union"
+
+    performance_targets:
+      mape: "<= 15% at 30-day horizon on held-out test set"
+      coverage_90pct_ci: ">= 88%"
+      inference_latency: "< 50ms per supplier per horizon"
+
+    training:
+      min_history_days: 180  # supplier must have 6 months of scores
+      schedule: "Monthly retraining using last 24 months of risk scores"
+
+# ------------------------------------------------------------------------------
+# 2. ML EXPERIMENT TRACKING (MLflow)
+# ------------------------------------------------------------------------------
+experiment_tracking:
+  mlflow_server:
+    backend_store: PostgreSQL (mlflow DB on RDS)
+    artifact_root: "s3://scvri-ml-artifacts-prod/mlflow/"
+    ui_auth: OAuth2 proxy → IAM ml_lead / risk_analyst roles
+
+  tracked_per_run:
+    - all hyperparameters
+    - training data snapshot hash (SHA-256)
+    - training duration + instance type
+    - train/val/test metrics (AUC-ROC, RMSE, MAE, F1)
+    - confusion matrix
+    - feature importance (top 20 features)
+    - SHAP global importance chart (artifact)
+    - bias report (artifact)
+    - drift baseline (artifact → used by future drift comparisons)
+
+  model_stages:
+    - Staging: auto-registered after successful training + eval
+    - Canary: deployed to 5% of scoring traffic
+    - Production: promoted if canary passes 24h shadowing checks
+    - Archived: previous production version (kept 90 days, then deleted except 1 per major version)
+
+# ------------------------------------------------------------------------------
+# 3. MODEL DEPLOYMENT & SERVING (Seldon Core)
+# ------------------------------------------------------------------------------
+model_serving:
+  composite_risk_scorer:
+    seldon_deployment: scvri-risk-scorer
+    replicas:
+      min: 4
+      max: 24
+    resources:
+      requests: {cpu: "2", memory: "4Gi"}
+      limits: {cpu: "4", memory: "8Gi"}
+    inference_graph:
+      - type: MODEL
+        implementation: SKLEARN_SERVER   # XGBoost sklearn-compatible
+      - type: COMBINER
+        name: ensemble-combiner
+        children:
+          - xgboost_scorer
+          - tabnet_scorer
+        custom_combiner: weighted_average_combiner.py
+    canary:
+      traffic_weight_canary: 5
+      traffic_weight_stable: 95
+      promotion_criteria:
+        - "MAE on shadow traffic <= 5.5 for 24h"
+        - "No drift_critical alert"
+        - "Bias metrics stable"
+
+  nlp_pipeline:
+    seldon_deployment: scvri-nlp-pipeline
+    replicas:
+      min: 3
+      max: 10
+    resources:
+      requests: {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+      limits: {cpu: "8", memory: "16Gi", nvidia.com/gpu: "1"}
+    node_selector: gpu-node-pool
+    serving_runtime: torchserve
+
+  predictive_forecaster:
+    seldon_deployment: scvri-forecaster
+    replicas:
+      min: 2
+      max: 8
+    resources:
+      requests: {cpu: "1", memory: "2Gi"}
+      limits: {cpu: "2", memory: "4Gi"}
+
+# ------------------------------------------------------------------------------
+# 4. MODEL GOVERNANCE CONTROLS
+# ------------------------------------------------------------------------------
+governance:
+  model_approval_workflow:
+    step_1: ml_lead submits model_run_id for promotion
+    step_2: Auto-run eval checklist (metrics check, bias check, drift baseline)
+    step_3: risk_analyst reviews SHAP global importance + bias report (manual sign-off)
+    step_4: compliance_officer reviews bias report for protected attributes (manual if bias metric delta > 0.05)
+    step_5: Canary deployment (5% traffic)
+    step_6: 24h shadow monitoring; automatic alert if degradation detected
+    step_7: ml_lead promotes to Production in MLflow → Seldon Helm chart update via ArgoCD
+
+  rollback_triggers:
+    automatic:
+      - AUC-ROC drops > 0.05 below previous production baseline in 4h window
+      - Prediction drift PSI > 0.25
+      - Error rate > 5% (model endpoint HTTP 5xx)
+    manual: ml_lead or on-call engineer
+
+  rollback_procedure:
+    step_1: POST /api/v1/admin/ml-models/{model_id}/rollback (ml_lead role required)
+    step_2: Update Seldon SeldonDeployment resource to previous model version
+    step_3: ArgoCD sync
+    step_4: Restore previous bias + drift baselines from MLflow artifact
+    step_5: Page ml_lead + risk_analyst
+    rollback_time: "< 5 minutes (ArgoCD + Kubernetes rolling update)"
+
+  feature_lineage:
+    tool: MLflow Datasets + custom lineage tracker
+    tracked_per_feature:
+      - source_table: supply.* or risk.external_intelligence
+      - extraction_query_hash
+      - transformation_code_version (git commit SHA)
+      - last_computed_at
+
+  model_cards:
+    format: Markdown (stored in S3 + displayed in MLflow UI)
+    required_sections:
+      - Model description + intended use
+      - Training data summary
+      - Performance metrics (overall + by subgroup)
+      - Limitations and caveats
+      - Bias evaluation results
+      - Recommended use restrictions
+
+# ------------------------------------------------------------------------------
+# 5. FEATURE STORE
+# ------------------------------------------------------------------------------
+feature_store:
+  online_store: Redis Cluster (sub-10ms feature retrieval at inference time)
+  offline_store: S3 (Parquet, partitioned by tenant_id + feature_date)
+  feature_groups:
+    - name: supplier_financial_features
+      entity: supplier_id
+      ttl_hours: 24
+      computed_by: risk-intelligence-service scoring pipeline
+      features: 9 financial risk features
+
+    - name: supplier_operational_features
+      entity: supplier_id
+      ttl_hours: 6
+      features: 9 operational features (OTD, lead time, IoT breach counts)
+
+    - name: supplier_geopolitical_features
+      entity: country_code
+      ttl_hours: 1
+      features: 7 geopolitical features (conflict index, port congestion, sanctions)
+
+    - name: supplier_esg_features
+      entity: supplier_id
+      ttl_hours: 168   # weekly from Refinitiv refresh
+      features: 7 ESG features
+
+    - name: supplier_cyber_features
+      entity: supplier_id
+      ttl_hours: 24
+      features: 4 cyber risk features (BitSight score, breach history)
+
+# ------------------------------------------------------------------------------
+# 6. SRS TRACEABILITY
+# ------------------------------------------------------------------------------
+srs_traceability:
+  - {srs_id: RISK-FR-001, implemented_by: "scvri-composite-risk-scorer XGBoost+TabNet with 87 features"}
+  - {srs_id: RISK-FR-002, implemented_by: "SHAP TreeExplainer per-prediction top-5 factors + natural language"}
+  - {srs_id: RISK-FR-003, implemented_by: "scvri-nlp-intelligence-pipeline BERT multi-label + NER"}
+  - {srs_id: RISK-FR-008, implemented_by: "scvri-predictive-forecaster BiLSTM+Prophet 30/90-day horizon"}
+  - {srs_id: NFR-ML-001, implemented_by: "Weekly retraining pipeline, drift detection, auto-rollback"}
+  - {srs_id: NFR-ML-002, implemented_by: "Bias monitoring (demographic parity <= 0.10)"}
+  - {srs_id: NFR-ML-003, implemented_by: "MLflow experiment tracking, model cards, feature lineage"}
+  - {srs_id: NFR-ML-004, implemented_by: "Model approval workflow with ml_lead + compliance_officer sign-off"}

@@ -1,0 +1,52 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: scvri
+
+# ── Resource list (apply order matters: namespace first, then config, then infra, then apps) ──
+resources:
+  # Foundation
+  - namespace.yaml
+  - configmaps.yaml
+  - secrets-template.yaml
+  # Infrastructure StatefulSets
+  - postgresql.yaml
+  - redis.yaml
+  - kafka.yaml
+  # Application services (port order: 8000 → 8005)
+  - iam.yaml
+  - supplier-management.yaml
+  - risk-intelligence.yaml
+  - visibility.yaml
+  - alert-engine.yaml
+  - integration.yaml
+  # Networking
+  - ingress.yaml
+  - network-policies.yaml
+  # Security & availability
+  - rbac.yaml
+  - pdbs.yaml
+
+# ── Common labels applied to every resource ───────────────────────────────────
+commonLabels:
+  app.kubernetes.io/part-of: scvri-platform
+  app.kubernetes.io/managed-by: kustomize
+
+# ── Common annotations ────────────────────────────────────────────────────────
+commonAnnotations:
+  scvri.io/platform-version: "1.0.0"
+
+# ── Image overrides — update tag here to roll out a new version ───────────────
+images:
+  - name: ghcr.io/scvri/iam
+    newTag: "1.0.0"
+  - name: ghcr.io/scvri/supplier-management
+    newTag: "1.0.0"
+  - name: ghcr.io/scvri/risk-intelligence
+    newTag: "1.0.0"
+  - name: ghcr.io/scvri/visibility
+    newTag: "1.0.0"
+  - name: ghcr.io/scvri/alert-engine
+    newTag: "1.0.0"
+  - name: ghcr.io/scvri/integration
+    newTag: "1.0.0"

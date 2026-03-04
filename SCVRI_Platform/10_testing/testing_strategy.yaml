@@ -1,0 +1,423 @@
+##############################################################################
+# MODULE 16 — TESTING STRATEGY
+# Coverage: Unit, Integration, E2E, Performance (k6), Chaos, Security, ML
+# Version: 1.0.0
+##############################################################################
+
+testing_strategy:
+  coverage_target: 80% line coverage on all services (enforced as CI gate)
+  test_environments:
+    local: docker-compose.test.yml (PostgreSQL 15, Redis, Kafka, mocked external APIs)
+    ci: GitHub Actions (ephemeral + docker services)
+    staging: Full EKS cluster (same as prod minus scale)
+    prod: Smoke tests only (non-destructive read-only)
+
+# ==============================================================================
+# 1. UNIT TESTS
+# ==============================================================================
+unit_tests:
+  framework: pytest 8.x + pytest-asyncio + pytest-xdist
+  mocking: unittest.mock, pytest-mock, responses (HTTP), fakeredis
+  database: pytest-postgresql (ephemeral real PostgreSQL per test session)
+  coverage_tool: pytest-cov + coverage.py
+  coverage_gate: 80% (enforced in CI)
+  parallelism: pytest-xdist (-n auto, up to 8 workers)
+
+  test_files_per_service:
+    visibility_service:
+      - tests/unit/test_supply_chain_map.py         # Graph traversal logic
+      - tests/unit/test_po_state_machine.py          # All 9 states × 8 transitions
+      - tests/unit/test_spend_at_risk.py
+      - tests/unit/test_caching.py                   # TTL, invalidation
+
+    risk_intelligence_service:
+      - tests/unit/test_risk_scoring_pipeline.py     # 7-step pipeline
+      - tests/unit/test_shap_explainer.py
+      - tests/unit/test_external_feed_circuit_breaker.py
+      - tests/unit/test_nlp_entity_matching.py
+      - tests/unit/test_forecast_ensemble.py
+
+    alert_engine:
+      - tests/unit/test_rule_evaluation.py           # All 10 CEP operators
+      - tests/unit/test_deduplication.py             # Redis NX + time windows
+      - tests/unit/test_escalation_state_machine.py
+      - tests/unit/test_sla_budget.py                # Assert total <= 300s
+
+    supplier_management:
+      - tests/unit/test_supplier_dedup.py            # pg_trgm fuzzy match
+      - tests/unit/test_scorecard_formulas.py        # OTD, defect, fill, invoice
+      - tests/unit/test_onboarding_workflow.py       # All state transitions
+      - tests/unit/test_cert_expiry.py               # Day window calculations
+
+    iam_service:
+      - tests/unit/test_jwt_creation.py
+      - tests/unit/test_jwt_validation.py            # exp, iss, aud, jti
+      - tests/unit/test_mfa_totp.py                 # RFC 6238 edge cases
+      - tests/unit/test_mfa_fido2.py
+      - tests/unit/test_rbac_permissions.py          # All 8 roles × all resources
+      - tests/unit/test_saml_assertion_parsing.py
+
+  critical_test_cases:
+    - name: "Tenant isolation — RLS prevents cross-tenant access"
+      file: tests/unit/test_tenant_isolation.py
+      cases:
+        - "Token for tenant_A cannot read supplier from tenant_B via any endpoint"
+        - "Score override as tenant_A supplier_id cannot be applied to tenant_B's supplier"
+        - "Portal token cannot call admin endpoints"
+        - "Portal token cannot access other suppliers in same tenant"
+      assertion: "All return 403 Forbidden or 404 Not Found; never return other tenant's data"
+
+    - name: "SLA budget — alert delivery <= 300s"
+      file: tests/unit/test_sla_budget.py
+      assertion: "Sum of all pipeline stages = 47s P50 (mocked timings)"
+
+    - name: "Idempotency — alert dedup"
+      file: tests/unit/test_deduplication.py
+      cases:
+        - "Same event arriving twice within dedup window → exactly 1 alert"
+        - "Same event after dedup window expires → new alert generated"
+
+# ==============================================================================
+# 2. INTEGRATION TESTS
+# ==============================================================================
+integration_tests:
+  framework: pytest + httpx (async HTTP client) + real docker-compose services
+  scope: "Service → real database + real Redis + real Kafka (dockerized)"
+  docker_compose: docker-compose.test.yml
+
+  test_suites:
+    api_integration:
+      - tests/integration/test_supplier_api.py
+        cases:
+          - "POST /suppliers → DB persisted, Kafka event emitted, cache invalidated"
+          - "GET /suppliers?search=acme → returns fuzzy match results"
+          - "POST /suppliers — duplicate DUNS → returns 409 with potential_duplicate_ids"
+          - "GET /suppliers/{id} → 360 profile assembled from 5 tables"
+
+      - tests/integration/test_risk_api.py
+        cases:
+          - "GET /risk/{id}/score → returns live score from risk.supplier_risk_scores"
+          - "POST /risk/{id}/score/override → MFA token required, audit trail written"
+          - "GET /risk/heatmap → ClickHouse query returns aggregated result"
+
+      - tests/integration/test_alert_workflow.py
+        cases:
+          - "Emit RiskScoreUpdatedEvent → Alert Engine consumes → alert created in alerts table"
+          - "Alert acknowledged → status=acknowledged in DB, Kafka event emitted"
+          - "Escalation timer fires at L1_escalate_minutes → escalation_level incremented"
+
+      - tests/integration/test_auth_flow.py
+        cases:
+          - "POST /auth/token (password) → valid JWT with correct claims"
+          - "POST /auth/token (expired refresh_token) → 401"
+          - "MFA required role → challenge_token returned → verify OTP → full JWT"
+          - "SAML ACS → JIT user created → correct roles assigned"
+
+      - tests/integration/test_gdpr_erasure.py
+        cases:
+          - "POST /compliance/erasure-requests → sla_deadline = today + 30 days"
+          - "Run erasure workflow → email replaced with erased_{id}@erased.invalid"
+          - "Post-erasure JWT revoked → 401 on next request"
+          - "Audit log actor_email pseudonymised (not deleted)"
+
+      - tests/integration/test_webhook_delivery.py
+        cases:
+          - "risk_score.critical event → webhook POST to subscriber endpoint"
+          - "HMAC-SHA256 signature verifiable by recipient"
+          - "Endpoint returns 5xx → retry with exponential backoff"
+          - "5 consecutive failures → webhook auto-disabled"
+
+      - tests/integration/test_kafka_events.py
+        cases:
+          - "SupplierCreated event produced → schema validates against SchemaRegistry"
+          - "Malformed event → routed to ingestion.dlq"
+          - "Consumer lag alert fires when lag > 10,000"
+
+# ==============================================================================
+# 3. END-TO-END TESTS (Playwright + API)
+# ==============================================================================
+e2e_tests:
+  framework: Playwright (TypeScript) for UI flows; pytest + httpx for API E2E
+  environment: staging cluster
+  run_schedule: post-deploy to staging (argocd sync hook)
+
+  critical_user_journeys:
+    - journey: "Supply chain executive reviews risk dashboard"
+      steps:
+        1: "Login via OIDC SSO → verify token + role = supply_chain_executive"
+        2: "Load executive dashboard → all 8 KPI widgets load in < 3s"
+        3: "Click supplier heatmap → drill into high-risk supplier detail"
+        4: "View risk score with top 5 SHAP factors"
+        5: "Run disruption scenario: supplier_failure for specific supplier"
+        6: "View spend at risk change in scenario result"
+      assertions:
+        - "All pages load < 3s P95"
+        - "Scenario result returns within 10s"
+        - "No console errors"
+
+    - journey: "Procurement officer onboards new supplier"
+      steps:
+        1: "POST /suppliers with new data → 201 Created"
+        2: "Verify Kafka SupplierCreated event emitted"
+        3: "Send onboarding questionnaire → status → questionnaire_sent"
+        4: "Simulate supplier portal login → view questionnaire"
+        5: "Upload ISO cert document → verify S3 pre-signed URL + document stored"
+        6: "Mark questionnaire complete → status → documents_requested"
+        7: "Procurement officer reviews → approves → status → active"
+        8: "Verify SupplierOnboardingCompleted event emitted"
+      sla: "Full workflow completable within 14 days (automated stages complete in < 2 min)"
+
+    - journey: "Risk alert triggers and is delivered"
+      steps:
+        1: "POST risk score update (score > 80) via internal scoring pipeline"
+        2: "Alert Engine evaluates SYSTEM-003 rule → creates alert"
+        3: "Alert delivered via Slack (mock Slack server receives) within 60s"
+        4: "supply_chain_manager acknowledges alert via API"
+        5: "Alert status = acknowledged, acknowledged_at populated"
+      assertion: "Alert email/Slack received within 60s of score event"
+
+    - journey: "Compliance officer processes GDPR erasure"
+      steps:
+        1: "POST /compliance/erasure-requests"
+        2: "Verify sla_deadline = today + 30 days"
+        3: "Trigger erasure worker manually"
+        4: "Verify user email replaced with erased_... pattern"
+        5: "Verify GET /suppliers/{id} returns masked contact info"
+        6: "Verify erasure_requests.status = completed"
+      assertion: "All PII removed within test execution (< 5 min for automated stages)"
+
+# ==============================================================================
+# 4. PERFORMANCE TESTS (k6)
+# ==============================================================================
+performance_tests:
+  tool: k6 0.52 + k6-operator (K8s native execution)
+  target_environment: staging (same node types as prod; 70% of prod capacity)
+
+  scenarios:
+    soak_test_normal_load:
+      description: "Sustained normal load for 1 hour"
+      executor: constant-vus
+      vus: 250    # 50% of 500-user target
+      duration: 1h
+      thresholds:
+        http_req_duration_p95: "< 500ms"
+        http_req_failed: "< 0.01"
+
+    stress_test_peak_load:
+      description: "Ramp to 500+ concurrent users"
+      executor: ramping-vus
+      stages:
+        - {duration: 5m, target: 100}
+        - {duration: 10m, target: 300}
+        - {duration: 10m, target: 500}
+        - {duration: 10m, target: 600}   # beyond target — test headroom
+        - {duration: 5m, target: 0}
+      thresholds:
+        http_req_duration_p95: "< 500ms"
+        http_req_failed: "< 0.01"
+        http_req_duration{name: dashboard}: "< 3000ms"
+
+    spike_test:
+      description: "Sudden 10× traffic spike (simulates breaking news event causing rush to check risk)"
+      executor: ramping-vus
+      stages:
+        - {duration: 30s, target: 50}
+        - {duration: 10s, target: 500}   # sudden spike
+        - {duration: 5m, target: 500}
+        - {duration: 30s, target: 0}
+      thresholds:
+        http_req_failed: "< 0.05"   # allow up to 5% errors during spike (graceful degradation)
+
+    risk_scoring_bulk:
+      description: "Score 10,000 suppliers in a single tenant concurrently"
+      executor: Celery task trigger (Python)
+      trigger: "POST /api/v1/risk/rescore-all (admin endpoint)"
+      expected_duration: "< 210s (10,000 suppliers / 50 per second)"
+      thresholds:
+        completion_time: "< 210s"
+        error_count: 0
+
+  k6_script_structure:
+    imports:
+      - k6/http
+      - k6/metrics
+      - k6/check
+    scenarios:
+      - Supplier list GET (40% of requests)
+      - Supplier 360 GET (20%)
+      - Risk score GET (20%)
+      - Alert list GET (10%)
+      - Dashboard summary (10%)
+    auth: "Setup stage obtains JWT; injected as Authorization header"
+
+# ==============================================================================
+# 5. CHAOS ENGINEERING
+# ==============================================================================
+chaos_tests:
+  tool: AWS Fault Injection Service (FIS) + Chaos Toolkit
+  schedule: monthly on staging + quarterly on prod (with change freeze exception)
+  approval: SRE lead + change management board
+
+  experiments:
+    - name: "RDS primary failover"
+      tool: AWS FIS
+      action: "Terminate RDS writer instance (triggers Aurora failover to read replica)"
+      expected_behavior:
+        - "RDS Proxy reroutes in < 30s"
+        - "API returns 503 for < 30s, then auto-recovers"
+        - "No data loss (RPO = 0 for RDS Multi-AZ)"
+      sla_assertion: "Downtime < 30s → within NFR-AVAIL-002 RTO"
+
+    - name: "Kafka broker failure (2 of 6 brokers)"
+      tool: AWS FIS
+      action: "Stop 2 MSK broker instances"
+      expected_behavior:
+        - "Producers continue with min.insync.replicas = 2 (4 brokers remaining)"
+        - "Consumer groups rebalance in < 60s"
+        - "No message loss (replication factor = 3)"
+
+    - name: "Redis shard failure"
+      tool: Chaos Toolkit
+      action: "Terminate one Redis shard primary"
+      expected_behavior:
+        - "Failover to replica in < 30s"
+        - "Cache miss during failover → DB queries serve requests (latency increase)"
+        - "No 5xx errors (graceful cache miss handling)"
+
+    - name: "Risk Intelligence Engine pod kill"
+      tool: Chaos Toolkit
+      action: "Kill all risk-intelligence-service pods"
+      expected_behavior:
+        - "Kubernetes recreates pods in < 60s"
+        - "Kafka consumer lag accumulates but processes after recovery"
+        - "Alerts still generated (rule engine caches last known scores)"
+
+    - name: "Network partition between services"
+      tool: Istio FaultInjection
+      action: "Inject 5s delay on 20% of requests to risk-intelligence-service"
+      expected_behavior:
+        - "Circuit breaker opens after 5 consecutive slow responses"
+        - "Visibility service returns stale scores with indicator"
+        - "P95 latency remains < 800ms (falls back to cache)"
+
+# ==============================================================================
+# 6. SECURITY TESTS
+# ==============================================================================
+security_tests:
+  owasp_zap_dast:
+    schedule: nightly against staging
+    scan_type: active scan
+    targets:
+      - https://api.staging.scvri.io/api/v1/
+      - https://portal.staging.scvri.io/
+    authentication: Zap scripted login (obtain JWT)
+    checks: [OWASP Top 10, API Security Top 10]
+    gate: New CRITICAL finding blocks prod deployment (P2 alert)
+
+  tenant_isolation_tests:
+    file: tests/security/test_tenant_isolation.py
+    test_count: 200+
+    approach: |
+      Create tenant_A + tenant_B with test data.
+      Use tenant_A JWT to attempt 100+ endpoint calls targeting tenant_B resource IDs.
+      Assert: ALL return 403 or 404; NEVER return tenant_B data.
+    run: every PR + nightly CI
+
+  rbac_tests:
+    file: tests/security/test_rbac_enforcement.py
+    approach: |
+      For each of the 8 roles, test access to every API endpoint.
+      Assert: forbidden endpoints return 403.
+      Assert: permitted endpoints return 200/201.
+    test_cases: ~300 (8 roles × ~37 critical endpoints)
+
+  injection_tests:
+    file: tests/security/test_injection.py
+    checks:
+      - SQL injection via query params (all numeric/string params)
+      - NoSQL injection via JSON body
+      - Path traversal in supplier_id/doc_id params
+      - SSRF via webhook endpoint_url field
+
+# ==============================================================================
+# 7. ML MODEL EVALUATION HARNESS
+# ==============================================================================
+ml_tests:
+  framework: pytest + scikit-learn metrics + evidently AI
+  run_schedule: "Before every model promotion (manual trigger + CI automation)"
+
+  test_suites:
+    model_accuracy:
+      file: tests/ml/test_model_accuracy.py
+      checks:
+        - "AUC-ROC >= 0.85 on held-out test set"
+        - "MAE <= 5.0 score points"
+        - "High-risk precision >= 0.80"
+        - "High-risk recall >= 0.75"
+      assertion: all checks must pass for promotion
+
+    bias_evaluation:
+      file: tests/ml/test_bias.py
+      checks:
+        - "Demographic parity difference by country_code <= 0.10"
+        - "Equalized odds difference <= 0.15"
+        - "Top 50 flagged-country suppliers reviewed manually for false high-risk flags"
+
+    drift_baseline:
+      file: tests/ml/test_drift_baseline.py
+      action: "Generate drift baseline (feature distributions + prediction distribution) on new model"
+      stored_in: "s3://scvri-ml-artifacts-prod/baselines/{model_id}/{run_id}/"
+
+    shap_consistency:
+      file: tests/ml/test_shap.py
+      checks:
+        - "SHAP values sum to model output (within 1e-4 tolerance)"
+        - "SHAP inference time < 100ms per supplier (P95 on 100-sample test)"
+
+    inference_latency:
+      file: tests/ml/test_inference_latency.py
+      thresholds:
+        composite_risk_scorer: "< 50ms P95 per supplier (batch of 500)"
+        nlp_pipeline: "< 2000ms P95 per article"
+        predictive_forecaster: "< 50ms P95 per supplier per horizon"
+
+# ==============================================================================
+# 8. SUMMARY CHECKLIST
+# ==============================================================================
+test_checklist:
+  - type: Unit
+    framework: pytest
+    coverage_target: 80%
+    ci_gate: true
+
+  - type: Integration
+    framework: pytest + docker-compose
+    ci_gate: true
+
+  - type: E2E
+    framework: Playwright + pytest
+    ci_gate: staging post-deploy
+
+  - type: Performance
+    tool: k6
+    schedule: nightly (staging) + pre-prod-release
+
+  - type: Chaos
+    tool: AWS FIS + Chaos Toolkit
+    schedule: monthly (staging) + quarterly (prod)
+
+  - type: Security (SAST)
+    tools: [Trivy, Bandit, Snyk, Gitleaks]
+    ci_gate: true (HIGH/CRITICAL blocking)
+
+  - type: Security (DAST)
+    tool: OWASP ZAP
+    schedule: nightly
+
+  - type: Tenant Isolation
+    framework: pytest
+    ci_gate: true
+
+  - type: ML Accuracy + Bias
+    framework: pytest + evidently
+    gate: model promotion blocked if thresholds fail

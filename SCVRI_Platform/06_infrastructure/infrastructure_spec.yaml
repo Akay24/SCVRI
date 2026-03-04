@@ -1,0 +1,582 @@
+##############################################################################
+# MODULE 11 — INFRASTRUCTURE: TERRAFORM MODULES + KUBERNETES MANIFESTS
+# Covers: EKS, RDS, MSK, ElastiCache, S3, VPC, Helm, Karpenter
+# Version: 1.0.0
+##############################################################################
+
+# ==============================================================================
+# TERRAFORM MODULES CATALOG
+# All modules live under: 06_infrastructure/terraform/modules/
+# Root configurations: 06_infrastructure/terraform/environments/{prod,staging,dr}/
+# ==============================================================================
+
+terraform_modules:
+
+  # ----------------------------------------------------------------------------
+  # VPC + NETWORKING
+  # ----------------------------------------------------------------------------
+  - module: vpc
+    source: ./modules/vpc
+    inputs:
+      region: us-east-1
+      vpc_cidr: "10.0.0.0/16"
+      azs: [us-east-1a, us-east-1b, us-east-1c]
+      public_subnets: ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+      private_subnets: ["10.0.10.0/24", "10.0.11.0/24", "10.0.12.0/24"]
+      database_subnets: ["10.0.20.0/24", "10.0.21.0/24", "10.0.22.0/24"]
+      enable_nat_gateway: true
+      single_nat_gateway: false   # one per AZ for HA
+      enable_vpn_gateway: false
+      enable_dns_hostnames: true
+      enable_dns_support: true
+      tags:
+        Environment: prod
+        Project: SCVRI
+        ManagedBy: Terraform
+    resources_created:
+      - aws_vpc
+      - aws_internet_gateway
+      - aws_nat_gateway × 3 (one per AZ)
+      - aws_route_table × 6
+      - aws_subnet × 9
+      - aws_vpc_flow_log (stored in S3 + CloudWatch)
+      - aws_security_group: default_deny_all
+
+  # ----------------------------------------------------------------------------
+  # EKS CLUSTER
+  # ----------------------------------------------------------------------------
+  - module: eks
+    source: ./modules/eks
+    inputs:
+      cluster_name: scvri-prod
+      cluster_version: "1.30"
+      vpc_id: module.vpc.vpc_id
+      subnet_ids: module.vpc.private_subnet_ids
+      endpoint_private_access: true
+      endpoint_public_access: false   # Access via VPN/bastion only
+      cluster_log_types: [api, audit, authenticator, controllerManager, scheduler]
+      kms_key_arn: module.kms.eks_secrets_key_arn
+
+      managed_node_groups:
+        system:
+          instance_types: [m6i.xlarge]
+          min_size: 3
+          max_size: 6
+          desired_size: 3
+          disk_size: 100
+          labels: {role: system}
+          taints: []
+
+        application:
+          instance_types: [m6i.2xlarge]
+          min_size: 3
+          max_size: 30
+          desired_size: 6
+          disk_size: 100
+          labels: {role: application}
+
+        memory_optimized:
+          instance_types: [r6i.2xlarge]
+          min_size: 2
+          max_size: 12
+          desired_size: 2
+          disk_size: 100
+          labels: {role: memory}
+          description: "For Redis, PostgreSQL proxies, large Java services"
+
+        gpu:
+          instance_types: [g4dn.xlarge]
+          min_size: 0
+          max_size: 4
+          desired_size: 1
+          disk_size: 200
+          ami_type: AL2_x86_64_GPU
+          labels: {role: gpu}
+          taints: [{key: nvidia.com/gpu, effect: NoSchedule}]
+
+      karpenter:
+        enabled: true
+        version: "0.35"
+        nodepool_config:
+          application_pool:
+            instance_categories: [c, m]
+            instance_cpu: [2, 4, 8, 16]
+            instance_memory: ">= 4Gi"
+            capacity_types: [on-demand, spot]
+            spot_fallback: true
+            disruption:
+              budget: {nodes: "5%"}
+              expireAfter: 720h   # 30 days
+          batch_pool:
+            instance_categories: [c, m, r]
+            capacity_types: [spot]
+
+      addons:
+        - vpc-cni: "v1.18"
+        - coredns: "v1.11"
+        - kube-proxy: "v1.30"
+        - aws-ebs-csi-driver: "v1.30"
+        - aws-efs-csi-driver: "v2.0"
+        - aws-load-balancer-controller: "v2.8"
+
+  # ----------------------------------------------------------------------------
+  # RDS AURORA POSTGRESQL
+  # ----------------------------------------------------------------------------
+  - module: rds_aurora
+    source: ./modules/rds-aurora
+    description: "Primary OLTP database. PostgreSQL 15 with Citus extension."
+    inputs:
+      cluster_id: scvri-aurora-prod
+      engine: aurora-postgresql
+      engine_version: "15.5"
+      instance_class: db.r6g.4xlarge
+      instances:
+        writer: 1
+        readers: 2         # 1 for app reads, 1 for analytics (analytics replica)
+      vpc_id: module.vpc.vpc_id
+      subnet_ids: module.vpc.database_subnet_ids
+      security_group_ids: [module.security_groups.rds_sg_id]
+      database_name: scvri
+      master_username: scvri_admin
+      manage_master_user_password: true    # AWS Secrets Manager auto-rotation
+      storage_encrypted: true
+      kms_key_id: module.kms.rds_key_arn
+      backup_retention_period: 14
+      preferred_backup_window: "02:00-03:00"
+      deletion_protection: true
+      enhanced_monitoring_interval: 30
+      performance_insights_enabled: true
+      performance_insights_retention_period: 731  # 2 years
+      auto_minor_version_upgrade: false    # manual control
+      enabled_cloudwatch_logs_exports: [postgresql]
+      db_parameters:
+        shared_preload_libraries: "citus,pg_stat_statements,pg_trgm"
+        max_connections: "LEAST({DBInstanceClassMemory/9531392},5000)"
+        work_mem: "256MB"
+        maintenance_work_mem: "2GB"
+        effective_cache_size: "12GB"
+        log_min_duration_statement: "1000"   # log queries > 1s
+        ssl: "1"
+      proxy:
+        enabled: true
+        name: scvri-rds-proxy
+        target: writer
+        idle_client_timeout: 1800
+        max_connections_percent: 100
+        max_idle_connections_percent: 50
+
+  # ----------------------------------------------------------------------------
+  # MSK (MANAGED KAFKA)
+  # ----------------------------------------------------------------------------
+  - module: msk
+    source: ./modules/msk
+    inputs:
+      cluster_name: scvri-kafka-prod
+      kafka_version: "3.7"
+      number_of_broker_nodes: 6
+      broker_node_instance_type: kafka.m6i.4xlarge
+      broker_storage_volume_size: 1000  # GB per broker
+      client_subnets: module.vpc.private_subnet_ids
+      security_groups: [module.security_groups.msk_sg_id]
+      encryption_in_transit:
+        client_broker: TLS
+        in_cluster: true
+      encryption_at_rest_kms_key_arn: module.kms.msk_key_arn
+      authentication:
+        sasl_scram: true      # SCRAM-SHA-512
+        certificate_authority_arn: module.acm_pca.ca_arn
+      broker_config:
+        auto_create_topics_enable: false
+        default_replication_factor: 3
+        min_insync_replicas: 2
+        log_retention_hours: 168   # 7 days
+        log_segment_bytes: 1073741824
+        num_partitions: 50
+        offsets_topic_replication_factor: 3
+      cloudwatch_logs:
+        enabled: true
+        log_group: /msk/scvri-kafka-prod
+      enhanced_monitoring: PER_TOPIC_PER_BROKER
+      prometheus:
+        jmx_exporter: true
+        node_exporter: true
+      s3_logs:
+        enabled: true
+        bucket: scvri-msk-logs-prod
+        prefix: kafka-broker-logs/
+
+  # ----------------------------------------------------------------------------
+  # ELASTICACHE REDIS
+  # ----------------------------------------------------------------------------
+  - module: elasticache_redis
+    source: ./modules/elasticache
+    inputs:
+      cluster_id: scvri-redis-prod
+      engine: redis
+      engine_version: "7.2"
+      node_type: cache.r6g.2xlarge
+      num_node_groups: 6       # 6 shards
+      replicas_per_node_group: 1  # 1 replica per shard = 12 nodes total
+      multi_az: true
+      automatic_failover: true
+      at_rest_encryption_enabled: true
+      transit_encryption_enabled: true
+      auth_token: stored_in_secrets_manager
+      subnet_group: module.vpc.elasticache_subnet_group
+      security_group_ids: [module.security_groups.redis_sg_id]
+      parameter_group:
+        maxmemory_policy: allkeys-lru
+        hz: 15
+        activedefrag: yes
+        active_defrag_ignore_bytes: 100mb
+      auto_minor_version_upgrade: false
+      snapshot_retention_limit: 5
+      snapshot_window: "03:00-04:00"
+
+  # ----------------------------------------------------------------------------
+  # S3 BUCKETS
+  # ----------------------------------------------------------------------------
+  - module: s3_buckets
+    source: ./modules/s3
+    buckets:
+      - name: scvri-supplier-docs-{tenant_id}    # per-tenant (created on-demand via API)
+        versioning: enabled
+        encryption: AES256 (SSE-S3)
+        lifecycle:
+          - prefix: ""
+            transition: [{days: 365, storage_class: STANDARD_IA}]
+            expiration: {days: 2555}  # 7 years
+        object_lock:
+          mode: COMPLIANCE
+          default_retention: {mode: COMPLIANCE, days: 2555}
+        bucket_policy: deny_public_access + deny_non_TLS + deny_delete_without_MFA
+
+      - name: scvri-report-output-{tenant_id}
+        versioning: disabled
+        encryption: AES256
+        lifecycle:
+          - expiration: {days: 7}   # Reports auto-expire
+        public_access_block: all_true
+
+      - name: scvri-ml-artifacts-prod
+        versioning: enabled
+        encryption: aws:kms (kms_key_id = module.kms.s3_ml_key_arn)
+        replication:
+          destination_bucket: scvri-ml-artifacts-dr (eu-west-1)
+        lifecycle:
+          - prefix: mlflow/experiments/
+            transition: [{days: 180, storage_class: GLACIER}]
+
+      - name: scvri-audit-archive-prod
+        versioning: enabled
+        encryption: aws:kms
+        object_lock:
+          mode: COMPLIANCE
+          default_retention: {mode: COMPLIANCE, years: 7}
+        replication:
+          destination_bucket: scvri-audit-archive-dr (eu-west-1)
+
+      - name: scvri-edi-inbound-{tenant_id}
+        versioning: enabled
+        encryption: AES256
+        lifecycle:
+          - transition: [{days: 90, storage_class: GLACIER}]
+
+      - name: scvri-terraform-state
+        versioning: enabled
+        encryption: aws:kms
+        bucket_policy: deny_public_access
+
+  # ----------------------------------------------------------------------------
+  # KMS KEYS
+  # ----------------------------------------------------------------------------
+  - module: kms
+    source: ./modules/kms
+    keys:
+      - alias: alias/scvri-rds-prod
+        description: RDS Aurora encryption
+        deletion_window: 30
+        enable_key_rotation: true
+      - alias: alias/scvri-msk-prod
+        description: MSK broker encryption
+        enable_key_rotation: true
+      - alias: alias/scvri-s3-ml
+        description: ML artifacts S3 encryption
+        enable_key_rotation: true
+      - alias: alias/scvri-eks-secrets
+        description: EKS secrets envelope encryption
+        enable_key_rotation: true
+      - alias: alias/scvri-pii
+        description: PII field encryption (contact info, banking)
+        enable_key_rotation: true
+        key_spec: SYMMETRIC_DEFAULT
+        key_usage: ENCRYPT_DECRYPT
+
+  # ----------------------------------------------------------------------------
+  # SECURITY GROUPS
+  # ----------------------------------------------------------------------------
+  - module: security_groups
+    source: ./modules/security-groups
+    groups:
+      eks_nodes:
+        ingress: [{port: 443, source: vpc_cidr}, {port: 10250, source: eks-control-plane-sg}]
+        egress: all outbound (restricted to VPC + internet via NAT)
+      rds:
+        ingress: [{port: 5432, source: eks_nodes_sg}]
+        egress: none
+      msk:
+        ingress: [{port: 9094, source: eks_nodes_sg}]  # TLS listener
+        egress: none
+      redis:
+        ingress: [{port: 6379, source: eks_nodes_sg}]
+        egress: none
+      alb:
+        ingress: [{port: 443, source: "0.0.0.0/0"}]
+        egress: [{port: 8000-9000, source: eks_nodes_sg}]
+
+  # ----------------------------------------------------------------------------
+  # OBSERVABILITY
+  # ----------------------------------------------------------------------------
+  - module: observability
+    source: ./modules/observability
+    inputs:
+      prometheus:
+        storage_size: 500Gi
+        retention: 90d
+      grafana:
+        admin_password: secrets_manager
+        oauth_enabled: true
+      jaeger:
+        collector_replicas: 3
+        es_index_prefix: scvri-traces
+        es_host: module.elasticsearch.endpoint
+      cloudwatch:
+        log_group_prefix: /scvri/prod/
+        log_retention_days: 90
+      pagerduty:
+        integration_key: secrets_manager
+        routes:
+          - critical → P1_SRE_ONCALL
+          - high → P2_SRE_ONCALL
+          - ml_model_drift → ML_LEAD_ONCALL
+
+# ==============================================================================
+# KUBERNETES MANIFESTS
+# ==============================================================================
+
+kubernetes_namespaces:
+  - scvri-prod
+  - scvri-infra
+  - istio-system
+  - monitoring
+  - logging
+  - argocd
+
+resource_quotas:
+  namespace: scvri-prod
+  hard:
+    requests.cpu: "200"
+    requests.memory: "400Gi"
+    limits.cpu: "400"
+    limits.memory: "800Gi"
+    pods: "500"
+    services: "50"
+    persistentvolumeclaims: "100"
+
+network_policies:
+  - name: default-deny-all
+    namespace: scvri-prod
+    spec:
+      podSelector: {}
+      policyTypes: [Ingress, Egress]
+    description: "Default deny all; individual services grant specific ingress/egress"
+
+  - name: allow-microservice-mesh
+    spec:
+      podSelector: {matchLabels: {app.kubernetes.io/part-of: scvri-platform}}
+      ingress:
+        - from: [{podSelector: {matchLabels: {app.kubernetes.io/part-of: scvri-platform}}}]
+          ports: [{port: 8000-9000, protocol: TCP}]
+      egress:
+        - to: [{podSelector: {matchLabels: {app.kubernetes.io/part-of: scvri-platform}}}]
+        - to: [{ipBlock: {cidr: "10.0.0.0/16"}}]
+          ports: [{port: 5432}, {port: 6379}, {port: 9094}]
+
+service_sample:
+  name: visibility-service
+  kind: Service
+  spec:
+    selector: {app: visibility-service}
+    ports: [{port: 80, targetPort: 8002, protocol: TCP}]
+    type: ClusterIP
+
+deployment_sample:
+  name: visibility-service
+  kind: Deployment
+  spec:
+    replicas: 3
+    selector:
+      matchLabels: {app: visibility-service}
+    template:
+      metadata:
+        labels:
+          app: visibility-service
+          app.kubernetes.io/part-of: scvri-platform
+          version: v1
+        annotations:
+          prometheus.io/scrape: "true"
+          prometheus.io/port: "9090"
+      spec:
+        serviceAccountName: visibility-service-sa
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 65534
+          fsGroup: 65534
+          seccompProfile: {type: RuntimeDefault}
+        containers:
+          - name: visibility-service
+            image: "123456789.dkr.ecr.us-east-1.amazonaws.com/scvri/visibility-service:1.0.0"
+            imagePullPolicy: Always
+            ports:
+              - containerPort: 8002
+            envFrom:
+              - secretRef: {name: visibility-service-secrets}
+              - configMapRef: {name: visibility-service-config}
+            resources:
+              requests: {cpu: "500m", memory: "1Gi"}
+              limits: {cpu: "2", memory: "2Gi"}
+            readinessProbe:
+              httpGet: {path: /ready, port: 8002}
+              initialDelaySeconds: 15
+              periodSeconds: 10
+            livenessProbe:
+              httpGet: {path: /health, port: 8002}
+              initialDelaySeconds: 30
+              periodSeconds: 15
+              failureThreshold: 3
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities: {drop: [ALL]}
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels: {app: visibility-service}
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - {key: app, operator: In, values: [visibility-service]}
+                topologyKey: kubernetes.io/hostname
+
+hpa_sample:
+  name: visibility-service-hpa
+  kind: HorizontalPodAutoscaler
+  apiVersion: autoscaling/v2
+  spec:
+    scaleTargetRef: {kind: Deployment, name: visibility-service}
+    minReplicas: 3
+    maxReplicas: 20
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target: {type: Utilization, averageUtilization: 65}
+      - type: External
+        external:
+          metric:
+            name: kafka_consumer_lag
+            selector:
+              matchLabels:
+                consumer_group: visibility-service-consumer
+          target: {type: AverageValue, averageValue: 5000}
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 60
+        policies:
+          - type: Pods; value: 4; periodSeconds: 60
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Pods; value: 2; periodSeconds: 60
+
+pdb_sample:
+  name: visibility-service-pdb
+  kind: PodDisruptionBudget
+  spec:
+    selector: {matchLabels: {app: visibility-service}}
+    minAvailable: 2      # always keep minimum 2 pods available during maintenance
+
+istio_config:
+  mtls_mode: STRICT      # All pod-to-pod communication mTLS enforced
+  peer_authentication:
+    name: default-mtls
+    namespace: scvri-prod
+    spec:
+      mtls: {mode: STRICT}
+  destination_rules:
+    circuit_breaker:
+      connectionPool:
+        tcp: {maxConnections: 100}
+        http: {http1MaxPendingRequests: 100, http2MaxRequests: 1000}
+      outlierDetection:
+        consecutive5xxErrors: 5
+        interval: 30s
+        baseEjectionTime: 30s
+        maxEjectionPercent: 50
+
+# ==============================================================================
+# HELM CHARTS
+# ==============================================================================
+helm_charts:
+  platform_umbrella:
+    chart: scvri-platform
+    values:
+      global:
+        imageRegistry: "123456789.dkr.ecr.us-east-1.amazonaws.com/scvri"
+        imagePullSecrets: [ecr-pull-secret]
+        environment: production
+        region: us-east-1
+      services:
+        visibility-service: {enabled: true, replicaCount: 3}
+        risk-intelligence-service: {enabled: true, replicaCount: 4}
+        alert-engine: {enabled: true, replicaCount: 4}
+        supplier-management-service: {enabled: true, replicaCount: 2}
+        iam-rbac-service: {enabled: true, replicaCount: 3}
+        integration-api-service: {enabled: true, replicaCount: 2}
+        analytics-service: {enabled: true, replicaCount: 2}
+      kafka:
+        bootstrapServers: module.msk.bootstrap_brokers_tls
+      redis:
+        host: module.elasticache_redis.configuration_endpoint_address
+      database:
+        proxyHost: module.rds_aurora.proxy_endpoint
+
+  third_party_charts:
+    - chart: kube-prometheus-stack / prometheus-community
+      namespace: monitoring
+      version: "60.x"
+    - chart: elasticsearch/kibana
+      namespace: logging
+      version: "8.14"
+    - chart: jaegertracing/jaeger
+      namespace: monitoring
+      version: "3.2"
+    - chart: argo-cd/argo-cd
+      namespace: argocd
+      version: "7.3"
+    - chart: istio/istiod
+      namespace: istio-system
+      version: "1.22"
+    - chart: kong/kong
+      namespace: scvri-infra
+      version: "2.40"
+    - chart: clickhouse-operator/clickhouse-operator
+      namespace: scvri-infra
+      version: "0.24"
+    - chart: seldon-core
+      namespace: scvri-infra
+      version: "1.17"

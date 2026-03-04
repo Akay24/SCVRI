@@ -1,0 +1,158 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Visibility Service — port 8003
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: visibility
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: visibility
+    app.kubernetes.io/part-of: scvri-platform
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: visibility
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: visibility
+        app.kubernetes.io/part-of: scvri-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8003"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: scvri-visibility
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: visibility
+                topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: visibility
+          image: ghcr.io/scvri/visibility:1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8003
+              name: http
+          envFrom:
+            - configMapRef:
+                name: scvri-common
+            - configMapRef:
+                name: scvri-visibility-config
+            - secretRef:
+                name: scvri-postgres-secret
+            - secretRef:
+                name: scvri-redis-secret
+          env:
+            - name: IAM_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: scvri-iam-keys
+                  key: IAM_PUBLIC_KEY
+          resources:
+            requests:
+              cpu: "300m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8003
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8003
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 4
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: visibility
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: visibility
+    app.kubernetes.io/part-of: scvri-platform
+spec:
+  selector:
+    app.kubernetes.io/name: visibility
+  ports:
+    - port: 8003
+      targetPort: 8003
+      name: http
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: visibility
+  namespace: scvri
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: visibility
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scvri-visibility
+  namespace: scvri

@@ -1,0 +1,390 @@
+##############################################################################
+# MODULE 12 — CI/CD PIPELINES SPECIFICATION
+# Platform: GitHub Actions + ArgoCD (GitOps)
+# Security: SAST, SCA, Container Scanning, DAST, Secrets Detection
+# Version: 1.0.0
+##############################################################################
+
+cicd_strategy:
+  version_control: GitHub (github.com/scvri-platform)
+  ci_platform: GitHub Actions
+  cd_platform: ArgoCD 2.11 (GitOps)
+  container_registry: Amazon ECR (us-east-1)
+  artifact_store: S3 (scvri-ci-artifacts)
+  gitops_repo: github.com/scvri-platform/platform-config (separate from app code)
+
+branch_strategy:
+  main: Protected. Production deployments only via PR merge.
+  develop: Staging deployments on merge.
+  release/*: Release candidates; used for hotfixes.
+  feature/*: PR branches; run full CI, no deployment.
+  hotfix/*: Emergency patch flow → direct to main with 2-reviewer approval.
+
+# ==============================================================================
+# CI PIPELINE — per microservice
+# ==============================================================================
+ci_pipeline:
+  name: "Service CI Pipeline"
+  trigger:
+    - push: [feature/*, develop, release/*]
+    - pull_request: [develop, main]
+
+  jobs:
+    lint_and_format:
+      runs_on: ubuntu-22.04
+      timeout_minutes: 5
+      steps:
+        - uses: actions/checkout
+        - name: Ruff lint (Python)
+          run: "ruff check . --output-format=github"
+        - name: Black format check
+          run: "black --check ."
+        - name: mypy type check
+          run: "mypy src/ --strict"
+
+    unit_tests:
+      runs_on: ubuntu-22.04
+      timeout_minutes: 15
+      needs: lint_and_format
+      services:
+        postgres:
+          image: postgres:15
+          env: {POSTGRES_DB: scvri_test, POSTGRES_PASSWORD: test}
+        redis:
+          image: redis:7.2
+      steps:
+        - uses: actions/checkout
+        - name: Install dependencies
+          run: "pip install -r requirements-dev.txt"
+        - name: Run pytest with coverage
+          run: |
+            pytest tests/unit/ \
+              --cov=src/ \
+              --cov-report=xml \
+              --cov-fail-under=80 \
+              --junit-xml=test-results/junit.xml \
+              -n auto    # pytest-xdist parallel
+        - name: Upload coverage to Codecov
+          uses: codecov/codecov-action
+        - name: SonarQube scan
+          uses: SonarSource/sonarcloud-github-action
+          env:
+            SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          with:
+            args: >
+              -Dsonar.qualitygate.wait=true
+              -Dsonar.coverage.exclusions=tests/**
+
+    sast_secrets:
+      runs_on: ubuntu-22.04
+      timeout_minutes: 10
+      needs: lint_and_format
+      steps:
+        - uses: actions/checkout
+          with: {fetch-depth: 0}
+        - name: Trivy filesystem SAST scan
+          run: |
+            trivy fs . \
+              --scanners vuln,secret,misconfig \
+              --format sarif \
+              --output trivy-results.sarif \
+              --severity HIGH,CRITICAL \
+              --exit-code 1
+        - name: Upload SARIF to GitHub Security
+          uses: github/codeql-action/upload-sarif
+          with:
+            sarif_file: trivy-results.sarif
+        - name: Gitleaks secrets detection
+          run: |
+            gitleaks detect --source=. \
+              --gitleaks-ignore-path=.gitleaksignore \
+              --exit-code 1
+        - name: Snyk SCA (dependencies)
+          run: |
+            snyk test \
+              --severity-threshold=high \
+              --fail-on=all
+          env:
+            SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        - name: Bandit Python security
+          run: |
+            bandit -r src/ \
+              -ll \
+              -f json \
+              -o bandit-report.json
+
+    build_push:
+      runs_on: ubuntu-22.04
+      timeout_minutes: 20
+      needs: [unit_tests, sast_secrets]
+      if: "github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'"
+      steps:
+        - uses: actions/checkout
+        - name: Configure AWS credentials
+          uses: aws-actions/configure-aws-credentials
+          with:
+            role-to-assume: arn:aws:iam::123456789:role/github-actions-ecr
+            aws-region: us-east-1
+        - name: Login to Amazon ECR
+          id: login-ecr
+          uses: aws-actions/amazon-ecr-login
+
+        - name: Set image tag
+          run: |
+            SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+            echo "IMAGE_TAG=${SHORT_SHA}-${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
+
+        - name: Build Docker image (multi-stage)
+          run: |
+            docker build \
+              --target production \
+              --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+              --build-arg GIT_COMMIT=${{ github.sha }} \
+              -t ${{ steps.login-ecr.outputs.registry }}/scvri/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }} \
+              -t ${{ steps.login-ecr.outputs.registry }}/scvri/${{ env.SERVICE_NAME }}:latest \
+              .
+
+        - name: Trivy container image scan
+          run: |
+            trivy image \
+              --scanners vuln \
+              --severity HIGH,CRITICAL \
+              --exit-code 1 \
+              --format table \
+              ${{ steps.login-ecr.outputs.registry }}/scvri/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
+
+        - name: Push to ECR
+          run: |
+            docker push ${{ steps.login-ecr.outputs.registry }}/scvri/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
+            docker push ${{ steps.login-ecr.outputs.registry }}/scvri/${{ env.SERVICE_NAME }}:latest
+
+        - name: Sign image with Cosign (supply chain security)
+          run: |
+            cosign sign --yes \
+              --key awskms:///alias/scvri-cosign-signing-key \
+              ${{ steps.login-ecr.outputs.registry }}/scvri/${{ env.SERVICE_NAME }}:${{ env.IMAGE_TAG }}
+
+    integration_tests:
+      runs_on: ubuntu-22.04
+      timeout_minutes: 20
+      needs: build_push
+      steps:
+        - uses: actions/checkout
+        - name: Run docker-compose test environment
+          run: docker-compose -f docker-compose.test.yml up -d
+        - name: Wait for services
+          run: sleep 30
+        - name: Run integration tests
+          run: pytest tests/integration/ --junit-xml=test-results/integration-junit.xml
+        - name: Tear down
+          if: always()
+          run: docker-compose -f docker-compose.test.yml down -v
+
+    update_gitops_repo:
+      runs_on: ubuntu-22.04
+      needs: integration_tests
+      steps:
+        - name: Update image tag in Helm values
+          run: |
+            # Clone platform-config repo
+            git clone https://x-access-token:${{ secrets.GITOPS_TOKEN }}@github.com/scvri-platform/platform-config.git
+            cd platform-config
+            # Update image tag using yq
+            TARGET_ENV=$([ "${{ github.ref }}" == "refs/heads/main" ] && echo "prod" || echo "staging")
+            yq -i '.services.${{ env.SERVICE_NAME }}.image.tag = "${{ env.IMAGE_TAG }}"' \
+              environments/${TARGET_ENV}/values.yaml
+            git config user.email "cicd@scvri.io"
+            git add .
+            git commit -m "ci: update ${{ env.SERVICE_NAME }} to ${{ env.IMAGE_TAG }} [skip ci]"
+            git push
+
+# ==============================================================================
+# ARGOCD GITOPS — CD PIPELINE
+# ==============================================================================
+argocd_configuration:
+  server: argocd.scvri-infra.svc.cluster.local:443
+  rbac:
+    admin: sre-team
+    readonly: dev-team
+  sync_policy: automated (pruning enabled)
+  self_heal: true
+  notification_targets: [slack#deployments, pagerduty (on sync failure)]
+
+  applications:
+    - name: scvri-platform-staging
+      project: default
+      source:
+        repoURL: github.com/scvri-platform/platform-config
+        targetRevision: HEAD
+        path: environments/staging
+        helm:
+          releaseName: scvri-platform
+          valueFiles: [values.yaml, values.staging.yaml]
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: scvri-staging
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions: [CreateNamespace=true, ServerSideApply=true]
+      ignoreDifferences:
+        - group: apps; kind: Deployment
+          jqPathExpressions: ['.spec.replicas']   # HPA controls replicas
+
+    - name: scvri-platform-prod
+      project: default
+      source:
+        repoURL: github.com/scvri-platform/platform-config
+        targetRevision: HEAD
+        path: environments/prod
+        helm:
+          releaseName: scvri-platform
+          valueFiles: [values.yaml, values.prod.yaml]
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: scvri-prod
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions: [ServerSideApply=true, PruneLast=true]
+      rolloutStrategy:
+        type: canary
+        steps:
+          - setWeight: 5
+          - pause: {duration: 15m}
+          - setWeight: 20
+          - pause: {duration: 15m}
+          - setWeight: 50
+          - pause: {duration: 30m}
+          - setWeight: 100
+        analysis:
+          successConditionMetrics:
+            - "sum(rate(http_requests_total{status=~'5..'}[5m])) / sum(rate(http_requests_total[5m])) < 0.01"
+            - "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) < 0.5"
+
+# ==============================================================================
+# PRODUCTION DEPLOYMENT PIPELINE (main branch merge)
+# ==============================================================================
+production_pipeline:
+  gates:
+    pre_deploy:
+      - All CI checks green (lint, unit, sast, build, integration)
+      - PR approved by >= 2 reviewers (1 must be tech lead / CODEOWNER)
+      - No HIGH/CRITICAL CVEs in container image (Trivy gate)
+      - SonarQube quality gate passed
+      - DAST scan result: no new Critical findings
+    post_canary_5pct:
+      - Error rate < 1% on canary pods (5 min window via Prometheus)
+      - P95 latency < 500ms (5 min window)
+      - No crash loops in canary pods
+    post_canary_20pct:
+      - Same as 5%, Window: 15 min
+    full_rollout:
+      - Zero errors for 30 min after 50% weight
+      - Auto-full-rollout gated on ArgoCD Analysis success
+
+  rollback:
+    auto_trigger: ArgoCD Analysis canary metric failure
+    manual_trigger: "kubectl argo rollouts abort {rollout_name}"
+    time_to_rollback: "< 3 minutes (Kubernetes rolling update)"
+    procedure:
+      1: ArgoCD aborts rollout → previous ReplicaSet promoted
+      2: Alert fired to SRE oncall
+      3: Postmortem required within 24h
+
+# ==============================================================================
+# SECURITY SCANNING TOOLS SUMMARY
+# ==============================================================================
+security_tools:
+  - tool: Trivy
+    version: "0.52"
+    scans: [filesystem SAST, container image CVE, IaC misconfig, secrets]
+    ci_gate: CRITICAL/HIGH → block
+
+  - tool: Snyk
+    version: latest
+    scans: [SCA (requirements.txt, package.json), container]
+    ci_gate: HIGH → block
+
+  - tool: Gitleaks
+    version: "8.18"
+    scans: [secrets in git history + staged files]
+    ci_gate: any secret → block
+
+  - tool: Bandit
+    version: "1.7"
+    scans: [Python SAST — common vulnerabilities (SQL injection, eval, etc.)]
+    ci_gate: HIGH severity → block
+
+  - tool: SonarQube / SonarCloud
+    version: "10.x"
+    scans: [code quality, coverage, duplications, cognitive complexity, security hotspots]
+    ci_gate: Quality gate "Sonar Way" must pass
+
+  - tool: OWASP ZAP (DAST)
+    version: "2.14"
+    schedule: nightly against staging
+    scans: [active scan on full API; passive scan on all requests]
+    ci_gate: New Critical finding → P2 alert + hold prod promotion
+
+  - tool: Cosign
+    purpose: Container image signing (Sigstore keyless + AWS KMS)
+    enforcement: Kubernetes admission webhook verifies signature before pod start
+
+  - tool: OPA/Gatekeeper
+    purpose: Kubernetes policy enforcement (no latest tag, require resource limits, no privileged pods, require labels)
+    policies:
+      - RequireResourceLimits
+      - DisallowLatestImageTag
+      - DisallowPrivilegedContainers
+      - RequireReadOnlyRootFilesystem
+      - RequireNonRootUser
+
+# ==============================================================================
+# DOCKERFILES (multi-stage, distroless)
+# ==============================================================================
+dockerfile_standard:
+  pattern: "multi-stage build → distroless/python3.12 final image"
+  example_structure: |
+    # Stage 1: Build dependencies
+    FROM python:3.12-slim AS builder
+    WORKDIR /build
+    RUN pip install --no-cache-dir --user -r requirements.txt
+
+    # Stage 2: Production (distroless)
+    FROM gcr.io/distroless/python3-debian12:nonroot AS production
+    COPY --from=builder /root/.local /root/.local
+    COPY src/ /app/src/
+    WORKDIR /app
+    EXPOSE 8000
+    USER nonroot:nonroot
+    CMD ["/app/src/main.py"]
+
+  requirements:
+    - No root user in production stage
+    - Read-only filesystem (enforced by K8s securityContext)
+    - No shell in distroless (prevents command injection)
+    - All secrets via environment variables (injected by K8s Secrets from AWS Secrets Manager CSI driver)
+
+# ==============================================================================
+# TERRAFORM CI/CD
+# ==============================================================================
+terraform_cicd:
+  tool: Terraform Cloud + GitHub Actions
+  workflow:
+    pr: "terraform plan → post plan output as PR comment"
+    merge_to_main: "terraform apply (auto-approve in Terraform Cloud after 2 human approvals)"
+    drift_detection:
+      schedule: "0 4 * * *"  # 4 AM daily
+      action: "terraform plan → alert SRE if non-empty diff"
+  lint_tools:
+    - tflint (AWS ruleset)
+    - tfsec
+    - checkov (IaC misconfiguration)
+  state_backend:
+    backend: S3 (scvri-terraform-state)
+    lock: DynamoDB (scvri-terraform-lock)
+    encryption: SSE-KMS

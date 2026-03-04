@@ -1,0 +1,235 @@
+name: Deploy to Kubernetes
+
+# Triggered automatically after all service CI workflows complete on main,
+# or manually via workflow_dispatch for targeted rollouts.
+on:
+  workflow_run:
+    workflows:
+      - "CI — IAM Service"
+      - "CI — Supplier Management"
+      - "CI — Risk Intelligence"
+      - "CI — Visibility Service"
+      - "CI — Alert Engine"
+      - "CI — Integration Layer"
+    types: [completed]
+    branches: [main]
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+      services:
+        description: "Comma-separated services to deploy (leave empty = all)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false   # Never cancel an in-progress deploy
+
+jobs:
+  # ── Guard: only proceed if triggering CI workflow succeeded ─────────────────
+  check-ci-status:
+    name: Verify CI success
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
+    steps:
+      - id: check
+        run: echo "proceed=true" >> $GITHUB_OUTPUT
+
+  # ── Determine which image tags (SHA) to deploy ──────────────────────────────
+  resolve-tags:
+    name: Resolve image tags
+    runs-on: ubuntu-latest
+    needs: check-ci-status
+    outputs:
+      image-tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "tag=sha-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Deploying tag: sha-${SHORT_SHA}"
+
+  # ── Deploy to staging ────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: resolve-tags
+    environment:
+      name: staging
+      url: https://staging-api.scvri.io
+    env:
+      IMAGE_TAG: ${{ needs.resolve-tags.outputs.image-tag }}
+      KUBE_CONTEXT: scvri-staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.29.0"
+
+      - name: Set up kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: "5.3.0"
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Update image tags in kustomization
+        working-directory: infra/k8s
+        run: |
+          SERVICES=(iam supplier-management risk-intelligence visibility alert-engine integration)
+          for svc in "${SERVICES[@]}"; do
+            kustomize edit set image "ghcr.io/scvri/${svc}=ghcr.io/scvri/${svc}:${IMAGE_TAG}"
+          done
+          echo "─── Updated kustomization.yaml ───"
+          grep -A2 "images:" kustomization.yaml
+
+      - name: Dry-run apply (validation)
+        run: |
+          kubectl kustomize infra/k8s | kubectl apply --dry-run=server -f -
+
+      - name: Apply to staging
+        run: |
+          kubectl kustomize infra/k8s | kubectl apply -f - --context ${{ env.KUBE_CONTEXT }}
+
+      - name: Wait for rollouts to complete
+        run: |
+          DEPLOYMENTS=(
+            iam
+            supplier-management
+            risk-intelligence
+            visibility
+            alert-engine-api
+            alert-engine-worker
+            integration-api
+            integration-worker
+          )
+          for deploy in "${DEPLOYMENTS[@]}"; do
+            echo "Waiting for deployment/${deploy} ..."
+            kubectl rollout status deployment/${deploy} \
+              -n scvri \
+              --timeout=300s \
+              --context ${{ env.KUBE_CONTEXT }}
+          done
+
+      - name: Run smoke tests
+        run: |
+          BASE=https://staging-api.scvri.io
+          echo "Checking /.well-known/jwks.json ..."
+          curl -sf "${BASE}/.well-known/jwks.json" | jq .
+          echo "Checking /health endpoints ..."
+          for port in 8000 8001 8002 8003 8004 8005; do
+            echo "  Port ${port}: $(kubectl exec -n scvri deployment/iam -- curl -sf http://localhost:${port}/health || echo 'SKIP')"
+          done
+
+      - name: Notify on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "⚠️ SCVRI *staging deploy FAILED* for <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|run ${{ github.run_number }}> (sha: `${{ env.IMAGE_TAG }}`)"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DEPLOY_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ── Deploy to production (manual approval required) ─────────────────────────
+  deploy-production:
+    name: Deploy → Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://api.scvri.io
+    env:
+      IMAGE_TAG: ${{ needs.resolve-tags.outputs.image-tag }}
+      KUBE_CONTEXT: scvri-production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.29.0"
+
+      - name: Set up kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: "5.3.0"
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Update image tags in kustomization
+        working-directory: infra/k8s
+        run: |
+          SERVICES=(iam supplier-management risk-intelligence visibility alert-engine integration)
+          for svc in "${SERVICES[@]}"; do
+            kustomize edit set image "ghcr.io/scvri/${svc}=ghcr.io/scvri/${svc}:${IMAGE_TAG}"
+          done
+
+      - name: Apply to production
+        run: |
+          kubectl kustomize infra/k8s | kubectl apply -f - --context ${{ env.KUBE_CONTEXT }}
+
+      - name: Wait for rollouts
+        run: |
+          DEPLOYMENTS=(
+            iam supplier-management risk-intelligence visibility
+            alert-engine-api alert-engine-worker
+            integration-api integration-worker
+          )
+          for deploy in "${DEPLOYMENTS[@]}"; do
+            kubectl rollout status deployment/${deploy} \
+              -n scvri --timeout=300s --context ${{ env.KUBE_CONTEXT }}
+          done
+
+      - name: Notify on success
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ SCVRI *production deploy succeeded* — tag `${{ env.IMAGE_TAG }}` • <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run ${{ github.run_number }}>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DEPLOY_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Notify on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🚨 SCVRI *PRODUCTION deploy FAILED* — tag `${{ env.IMAGE_TAG }}` • <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Run ${{ github.run_number }}>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DEPLOY_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

@@ -1,0 +1,162 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Apache Kafka 3 — KRaft mode (no ZooKeeper), single-broker
+# For production use 3+ brokers; this is the baseline manifest.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-config
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/part-of: scvri-platform
+data:
+  server.properties: |
+    # KRaft — no ZooKeeper
+    process.roles=broker,controller
+    node.id=1
+    controller.quorum.voters=1@kafka-0.kafka.scvri.svc.cluster.local:29093
+    listeners=PLAINTEXT://:9092,CONTROLLER://:29093
+    advertised.listeners=PLAINTEXT://kafka-0.kafka.scvri.svc.cluster.local:9092
+    listener.security.protocol.map=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+    controller.listener.names=CONTROLLER
+    inter.broker.listener.name=PLAINTEXT
+    log.dirs=/var/kafka/data
+    num.partitions=6
+    default.replication.factor=1
+    min.insync.replicas=1
+    auto.create.topics.enable=true
+    log.retention.hours=168
+    log.retention.bytes=10737418240
+    log.segment.bytes=1073741824
+    log.cleanup.policy=delete
+    offsets.topic.replication.factor=1
+    transaction.state.log.replication.factor=1
+    transaction.state.log.min.isr=1
+    group.initial.rebalance.delay.ms=3000
+    socket.send.buffer.bytes=102400
+    socket.receive.buffer.bytes=102400
+    socket.request.max.bytes=104857600
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/part-of: scvri-platform
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kafka
+  ports:
+    - port: 9092
+      targetPort: 9092
+      name: broker
+    - port: 29093
+      targetPort: 29093
+      name: controller
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: scvri
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/part-of: scvri-platform
+    app.kubernetes.io/version: "3"
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka
+        app.kubernetes.io/part-of: scvri-platform
+    spec:
+      securityContext:
+        fsGroup: 1001
+        runAsUser: 1001
+        runAsNonRoot: true
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        - name: kafka-init
+          image: apache/kafka:3.8.0
+          command:
+            - bash
+            - -c
+            - |
+              # Format KRaft storage on first run (idempotent)
+              if [ ! -f /var/kafka/data/meta.properties ]; then
+                CLUSTER_ID=$(kafka-storage.sh random-uuid)
+                kafka-storage.sh format -t "$CLUSTER_ID" \
+                  -c /etc/kafka/server.properties
+              fi
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /var/kafka/data
+            - name: kafka-config
+              mountPath: /etc/kafka
+      containers:
+        - name: kafka
+          image: apache/kafka:3.8.0
+          ports:
+            - containerPort: 9092
+              name: broker
+            - containerPort: 29093
+              name: controller
+          command:
+            - kafka-server-start.sh
+            - /etc/kafka/server.properties
+          env:
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xmx2g -Xms1g"
+            - name: KAFKA_JVM_PERFORMANCE_OPTS
+              value: "-server -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:+ExplicitGCInvokesConcurrent"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /var/kafka/data
+            - name: kafka-config
+              mountPath: /etc/kafka
+          readinessProbe:
+            exec:
+              command:
+                - kafka-broker-api-versions.sh
+                - --bootstrap-server
+                - localhost:9092
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 4
+      volumes:
+        - name: kafka-config
+          configMap:
+            name: kafka-config
+  volumeClaimTemplates:
+    - metadata:
+        name: kafka-data
+        labels:
+          app.kubernetes.io/name: kafka
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: fast-ssd
+        resources:
+          requests:
+            storage: 50Gi

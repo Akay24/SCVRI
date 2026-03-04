@@ -1,0 +1,724 @@
+# SCVRI Platform — Event-Driven Architecture
+# Kafka Topology, Topic Definitions, Event Contracts, Consumer Groups
+# SRS Coverage: NFR-SCAL-005, VIS-FR-002/003, RISK-FR-001/003, ALERT-FR-001
+# Scale Target: 100,000+ events/sec across all tenants
+# Retention: 7 days (hot replay), 90 days (cold archive to S3)
+# Guarantee: At-least-once delivery (idempotent consumers); exactly-once on financial events
+# =============================================================================
+
+# ----- CLUSTER SIZING MATH -----
+# Target: 100,000 events/sec sustained; 150,000 events/sec burst (1.5x headroom)
+# Avg event size: ~2KB
+# Sustained throughput: 100,000 * 2KB = 200 MB/s write
+# Kafka broker throughput ceiling (m6i.4xlarge, 10 Gbps NIC): ~600 MB/s
+# Required brokers (200 MB/s / 400 MB/s per broker with replication factor 3): 3 brokers minimum
+# Production sizing: 6 brokers for N+3 redundancy, distributed across 3 AZs (2 per AZ)
+# 6 brokers × 32 vCPU × 128 GB RAM × 20 TB NVMe SSD (gp3 io2)
+# Replication factor: 3 (all topics), min.insync.replicas: 2
+# Partition count per topic: derived per topic below
+
+---
+# =============================================================================
+# TOPIC REGISTRY
+# Format: <domain>.<entity>.<event_type>
+# =============================================================================
+topics:
+
+  # ---------------------------------------------------------------------------
+  # INGESTION TOPICS — raw events from external systems
+  # ---------------------------------------------------------------------------
+  - name: scvri.ingestion.erp_events
+    description: >
+      Raw events ingested from ERP systems (SAP, Oracle, Dynamics).
+      Includes PO creation, PO updates, GRNs, invoice events, supplier master changes.
+    partitions: 64
+    replication_factor: 3
+    retention_ms: 604800000          # 7 days
+    min_insync_replicas: 2
+    compression_type: lz4
+    max_message_bytes: 1048576       # 1MB
+    cleanup_policy: delete
+    # Partition key: tenant_id (ensures ordering per tenant)
+    # Scale math: SAP S/4HANA generates ~500 events/sec per large tenant
+    #             64 partitions × 500 tenant limit → handles burst from any single tenant
+    consumer_groups:
+      - name: visibility-service
+        lag_alert_threshold: 10000
+      - name: supplier-service
+        lag_alert_threshold: 5000
+      - name: analytics-etl
+        lag_alert_threshold: 50000
+
+  - name: scvri.ingestion.tms_tracking
+    description: >
+      Real-time shipment tracking events from TMS/carrier APIs
+      (project44, Descartes, FedEx, UPS, Maersk, etc.)
+    partitions: 96
+    replication_factor: 3
+    retention_ms: 604800000
+    min_insync_replicas: 2
+    compression_type: lz4
+    max_message_bytes: 524288        # 512KB
+    consumer_groups:
+      - name: visibility-service
+        lag_alert_threshold: 5000
+      - name: analytics-etl
+        lag_alert_threshold: 50000
+
+  - name: scvri.ingestion.iot_telemetry
+    description: >
+      High-volume IoT sensor data: GPS, temperature, humidity, shock from
+      cold chain and asset tracking sensors. MQTT→Kafka bridge.
+    partitions: 128
+    replication_factor: 3
+    retention_ms: 259200000          # 3 days (high volume, archive to ClickHouse)
+    min_insync_replicas: 2
+    compression_type: snappy
+    max_message_bytes: 65536         # 64KB (small sensor payloads)
+    # Scale math: 10,000 IoT devices × 1 event/sec = 10,000 events/sec
+    #             128 partitions × ~780 events/sec/partition = comfortable
+    consumer_groups:
+      - name: visibility-service-iot
+        lag_alert_threshold: 20000
+      - name: analytics-etl-iot
+        lag_alert_threshold: 100000
+
+  - name: scvri.ingestion.external_intelligence
+    description: >
+      External data feeds: D&B credit data, Refinitiv ESG/news, weather events,
+      port congestion, geopolitical alerts, financial filings.
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    min_insync_replicas: 2
+    compression_type: lz4
+    consumer_groups:
+      - name: risk-intelligence-engine
+        lag_alert_threshold: 1000
+      - name: analytics-etl
+        lag_alert_threshold: 10000
+
+  - name: scvri.ingestion.news_nlp_raw
+    description: >
+      Raw news articles and social media content requiring NLP classification.
+      High-throughput ML inference pipeline input.
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 86400000           # 1 day (processed quickly, archive after scoring)
+    consumer_groups:
+      - name: nlp-pipeline
+        lag_alert_threshold: 2000
+
+  # ---------------------------------------------------------------------------
+  # DOMAIN EVENT TOPICS — normalized domain events from microservices
+  # ---------------------------------------------------------------------------
+  - name: scvri.visibility.shipment_events
+    description: >
+      Normalized shipment status change events. Published by Visibility Service
+      after processing raw TMS events.
+    partitions: 48
+    replication_factor: 3
+    retention_ms: 604800000
+    compression_type: lz4
+    consumer_groups:
+      - name: alert-engine
+        lag_alert_threshold: 1000
+      - name: risk-intelligence-engine
+        lag_alert_threshold: 5000
+      - name: analytics-etl
+        lag_alert_threshold: 20000
+
+  - name: scvri.visibility.iot_breach_events
+    description: >
+      Emitted by Visibility Service when IoT sensor threshold is breached.
+      Prioritized topic, alert-engine monitors with lowest lag tolerance.
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    consumer_groups:
+      - name: alert-engine
+        lag_alert_threshold: 100      # near-realtime for critical alerts
+      - name: analytics-etl
+        lag_alert_threshold: 5000
+
+  - name: scvri.visibility.po_lifecycle_events
+    description: >
+      PO state machine transitions: open → confirmed → shipped → received, etc.
+    partitions: 48
+    replication_factor: 3
+    retention_ms: 604800000
+    consumer_groups:
+      - name: alert-engine
+        lag_alert_threshold: 2000
+      - name: analytics-etl
+        lag_alert_threshold: 20000
+
+  - name: scvri.visibility.lead_time_deviation_events
+    description: >
+      Emitted when shipment ETA deviates beyond configurable threshold (VIS-FR-005).
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    consumer_groups:
+      - name: alert-engine
+        lag_alert_threshold: 500
+
+  - name: scvri.risk.score_updated_events
+    description: >
+      Risk score recalculation completed. Triggers alert evaluation and UI push.
+      Score delta stored in payload for ALERT-FR-001 (10-point delta trigger).
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    compression_type: lz4
+    consumer_groups:
+      - name: alert-engine
+        lag_alert_threshold: 500     # <60s risk score refresh SLA
+      - name: websocket-push-service
+        lag_alert_threshold: 200
+      - name: analytics-etl
+        lag_alert_threshold: 10000
+
+  - name: scvri.risk.intelligence_events
+    description: >
+      Processed risk intelligence events after NLP scoring and entity matching.
+      Published by Risk Intelligence Engine after matching to tenant suppliers.
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    consumer_groups:
+      - name: alert-engine
+        lag_alert_threshold: 500
+      - name: analytics-etl
+        lag_alert_threshold: 10000
+
+  - name: scvri.supplier.lifecycle_events
+    description: >
+      Supplier onboarding, status changes, scorecard updates, certification events.
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    consumer_groups:
+      - name: alert-engine
+        lag_alert_threshold: 500
+      - name: risk-intelligence-engine
+        lag_alert_threshold: 2000
+      - name: analytics-etl
+        lag_alert_threshold: 10000
+
+  # ---------------------------------------------------------------------------
+  # ALERT TOPICS — internal alert routing
+  # ---------------------------------------------------------------------------
+  - name: scvri.alerts.generated
+    description: >
+      New alerts generated by Alert Engine after rule evaluation.
+      Consumed by Notification Service for multi-channel delivery.
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    consumer_groups:
+      - name: notification-service
+        lag_alert_threshold: 50       # <5 min delivery SLA — ultra-low lag
+
+  - name: scvri.alerts.delivery_status
+    description: >
+      Delivery confirmations/failures from notification providers.
+      Used for retry scheduling and audit log.
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 259200000
+    consumer_groups:
+      - name: alert-engine
+        lag_alert_threshold: 1000
+      - name: analytics-etl
+        lag_alert_threshold: 5000
+
+  # ---------------------------------------------------------------------------
+  # INTEGRATION TOPICS — outbound webhooks and ETL sync
+  # ---------------------------------------------------------------------------
+  - name: scvri.integration.outbound_webhooks
+    description: >
+      Events to be delivered to customer webhook endpoints (INT-FR-003).
+      Partition by tenant_id to preserve per-tenant ordering.
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    consumer_groups:
+      - name: webhook-delivery-service
+        lag_alert_threshold: 5000
+
+  - name: scvri.integration.erp_write_queue
+    description: >
+      Outbound updates to ERP systems (e.g., PO acknowledgement, GRN confirmation).
+      Exactly-once semantics enabled (financial data integrity).
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 604800000
+    min_insync_replicas: 2
+    transactional: true              # enable Kafka transactions
+    consumer_groups:
+      - name: erp-connector-service
+        lag_alert_threshold: 500
+        exactly_once: true
+
+  # ---------------------------------------------------------------------------
+  # AUDIT TOPICS — feed immutable audit store
+  # ---------------------------------------------------------------------------
+  - name: scvri.audit.user_actions
+    description: >
+      All user and system actions for audit trail (IAM-FR-005, INT-FR-007).
+      Retention: 2 years (hot 7 days, archived to S3 immutable bucket).
+    partitions: 32
+    replication_factor: 3
+    retention_ms: 604800000
+    consumer_groups:
+      - name: audit-writer-service
+        lag_alert_threshold: 5000
+
+  # ---------------------------------------------------------------------------
+  # DEAD LETTER QUEUES — all processing failures route here
+  # ---------------------------------------------------------------------------
+  - name: scvri.dlq.ingestion_errors
+    description: >
+      Events that failed schema validation or processing after 3 retries.
+      Human review queue consumed by ops dashboard.
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 2592000000        # 30 days
+    consumer_groups:
+      - name: dlq-review-service
+        lag_alert_threshold: 10000
+
+  - name: scvri.dlq.notification_failures
+    description: >
+      Alert delivery failures after all provider fallbacks exhausted.
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 2592000000
+    consumer_groups:
+      - name: dlq-review-service
+        lag_alert_threshold: 1000
+
+  - name: scvri.dlq.webhook_failures
+    description: >
+      Webhook delivery failures after 5 retry attempts with exponential backoff.
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 2592000000
+    consumer_groups:
+      - name: dlq-review-service
+        lag_alert_threshold: 1000
+
+  # ---------------------------------------------------------------------------
+  # ANALYTICS STREAMING TOPICS
+  # ---------------------------------------------------------------------------
+  - name: scvri.analytics.kri_stream
+    description: >
+      KRI metric snapshots published every 5 minutes per active tenant.
+      Consumed by ClickHouse Kafka Materialized View for real-time analytics.
+    partitions: 16
+    replication_factor: 3
+    retention_ms: 86400000
+    consumer_groups:
+      - name: clickhouse-kri-sink
+        lag_alert_threshold: 10000
+      - name: analytics-aggregation-service
+        lag_alert_threshold: 5000
+
+  - name: scvri.analytics.spend_at_risk_stream
+    description: >
+      Real-time spend-at-risk calculations when risk scores cross thresholds.
+    partitions: 8
+    replication_factor: 3
+    retention_ms: 604800000
+    consumer_groups:
+      - name: analytics-etl
+        lag_alert_threshold: 2000
+
+---
+# =============================================================================
+# EVENT SCHEMA CONTRACTS (Avro-compatible JSON Schema)
+# Schema Registry: Confluent Schema Registry (AWS MSK managed)
+# Compatibility: BACKWARD (new optional fields only)
+# =============================================================================
+schemas:
+
+  # ---------------------------------------------------------------------------
+  # ENVELOPE — all events wrapped in this envelope
+  # ---------------------------------------------------------------------------
+  EventEnvelope:
+    type: object
+    required: [event_id, event_type, version, tenant_id, timestamp, payload]
+    properties:
+      event_id:
+        type: string
+        format: uuid
+        description: Globally unique event ID (UUID v4). Used for idempotency.
+      event_type:
+        type: string
+        description: Fully qualified event type (e.g., "scvri.risk.score_updated.v1")
+      version:
+        type: integer
+        description: Schema version number for backward compatibility
+      tenant_id:
+        type: string
+        format: uuid
+        description: Tenant identifier. Partition key for all topics.
+      correlation_id:
+        type: string
+        format: uuid
+        description: Trace correlation ID linking events across services
+      causation_id:
+        type: string
+        format: uuid
+        description: event_id of the parent event that caused this event
+      timestamp:
+        type: string
+        format: date-time
+        description: ISO-8601 UTC timestamp when event occurred
+      source_service:
+        type: string
+        description: Originating microservice name
+      payload:
+        type: object
+        description: Event-specific payload (see below)
+
+  # ---------------------------------------------------------------------------
+  # SHIPMENT STATUS CHANGED EVENT
+  # Topic: scvri.visibility.shipment_events
+  # ---------------------------------------------------------------------------
+  ShipmentStatusChangedEvent:
+    event_type: "scvri.visibility.shipment_status_changed.v1"
+    payload:
+      type: object
+      required: [shipment_id, supplier_id, previous_status, new_status, status_changed_at]
+      properties:
+        shipment_id: {type: string, format: uuid}
+        po_id: {type: string, format: uuid}
+        supplier_id: {type: string, format: uuid}
+        tracking_number: {type: string}
+        carrier_name: {type: string}
+        transport_mode: {type: string, enum: [ocean, air, road, rail, multimodal]}
+        previous_status: {type: string}
+        new_status: {type: string}
+        current_location:
+          type: object
+          properties:
+            lat: {type: number}
+            lng: {type: number}
+            description: {type: string}
+        eta: {type: string, format: date-time}
+        eta_deviation_hours: {type: number, description: "Positive = delayed, negative = early"}
+        status_changed_at: {type: string, format: date-time}
+        source_system: {type: string}
+
+  # ---------------------------------------------------------------------------
+  # IOT THRESHOLD BREACH EVENT
+  # Topic: scvri.visibility.iot_breach_events
+  # ---------------------------------------------------------------------------
+  IoTBreachEvent:
+    event_type: "scvri.visibility.iot_threshold_breach.v1"
+    payload:
+      type: object
+      required: [shipment_id, sensor_id, sensor_type, breach_value, threshold_value, breach_direction]
+      properties:
+        shipment_id: {type: string, format: uuid}
+        sensor_id: {type: string}
+        sensor_type: {type: string, enum: [temperature, humidity, gps, shock, light]}
+        breach_value: {type: number}
+        threshold_value: {type: number}
+        breach_direction: {type: string, enum: [above, below]}
+        unit: {type: string}
+        location:
+          type: object
+          properties:
+            lat: {type: number}
+            lng: {type: number}
+        recorded_at: {type: string, format: date-time}
+
+  # ---------------------------------------------------------------------------
+  # RISK SCORE UPDATED EVENT
+  # Topic: scvri.risk.score_updated_events
+  # ---------------------------------------------------------------------------
+  RiskScoreUpdatedEvent:
+    event_type: "scvri.risk.score_updated.v1"
+    payload:
+      type: object
+      required: [supplier_id, composite_score, previous_composite_score, score_delta, model_version, scored_at]
+      properties:
+        supplier_id: {type: string, format: uuid}
+        composite_score: {type: number, minimum: 0, maximum: 100}
+        previous_composite_score: {type: number}
+        score_delta: {type: number, description: "Positive = risk increased"}
+        dimension_scores:
+          type: object
+          properties:
+            financial: {type: number}
+            operational: {type: number}
+            geopolitical: {type: number}
+            esg: {type: number}
+            concentration: {type: number}
+            cyber: {type: number}
+            natural_hazard: {type: number}
+        shap_top_factors:
+          type: array
+          maxItems: 5
+          items:
+            type: object
+            properties:
+              factor_name: {type: string}
+              dimension: {type: string}
+              shap_value: {type: number}
+              direction: {type: string, enum: [increasing_risk, decreasing_risk]}
+        model_version: {type: string}
+        model_name: {type: string}
+        scored_at: {type: string, format: date-time}
+        valid_until: {type: string, format: date-time}
+        is_override: {type: boolean, default: false}
+        trigger_type:
+          type: string
+          enum: [scheduled, data_freshness, manual, drift_detected, model_retrained]
+
+  # ---------------------------------------------------------------------------
+  # SUPPLIER RISK INTELLIGENCE EVENT
+  # Topic: scvri.risk.intelligence_events
+  # ---------------------------------------------------------------------------
+  RiskIntelligenceEvent:
+    event_type: "scvri.risk.intelligence_event.v1"
+    payload:
+      type: object
+      required: [intel_id, source, event_type_category, severity, matched_supplier_ids, headline]
+      properties:
+        intel_id: {type: string, format: uuid}
+        source: {type: string}
+        event_type_category:
+          type: string
+          enum: [disruption, financial_distress, geopolitical, esg_violation, natural_disaster, cyber_incident, port_congestion, regulatory_change]
+        severity: {type: string, enum: [critical, high, medium, low]}
+        affected_countries: {type: array, items: {type: string, minLength: 2, maxLength: 2}}
+        matched_supplier_ids: {type: array, items: {type: string, format: uuid}}
+        matched_tenant_ids: {type: array, items: {type: string, format: uuid}}
+        headline: {type: string}
+        description: {type: string}
+        confidence_level: {type: number, minimum: 0, maximum: 1}
+        spend_at_risk_usd: {type: number}
+        published_at: {type: string, format: date-time}
+        ingested_at: {type: string, format: date-time}
+        source_url: {type: string, format: uri}
+
+  # ---------------------------------------------------------------------------
+  # ALERT GENERATED EVENT
+  # Topic: scvri.alerts.generated
+  # ---------------------------------------------------------------------------
+  AlertGeneratedEvent:
+    event_type: "scvri.alert.generated.v1"
+    payload:
+      type: object
+      required: [alert_id, rule_id, severity, entity_type, entity_id, title, delivery_channels, generated_at]
+      properties:
+        alert_id: {type: string, format: uuid}
+        rule_id: {type: string, format: uuid}
+        severity: {type: string, enum: [critical, high, medium, low]}
+        entity_type: {type: string, enum: [supplier, shipment, po, region, platform]}
+        entity_id: {type: string}
+        title: {type: string}
+        body: {type: string}
+        delivery_channels:
+          type: array
+          items: {type: string, enum: [email, sms, slack, teams, webhook, in_app]}
+        recipient_user_ids:
+          type: array
+          items: {type: string, format: uuid}
+        ai_mitigation_actions:
+          type: array
+          items:
+            type: object
+            properties:
+              action_type: {type: string}
+              description: {type: string}
+              priority: {type: integer}
+              alternate_suppliers:
+                type: array
+                items: {type: string, format: uuid}
+        dedup_key: {type: string}
+        event_detected_at: {type: string, format: date-time}
+        generated_at: {type: string, format: date-time}
+        # SLA tracking: generated_at - event_detected_at must be < 300s (5 min)
+        sla_deadline: {type: string, format: date-time}
+
+  # ---------------------------------------------------------------------------
+  # SUPPLIER LIFECYCLE EVENT
+  # Topic: scvri.supplier.lifecycle_events
+  # ---------------------------------------------------------------------------
+  SupplierLifecycleEvent:
+    event_type: "scvri.supplier.lifecycle.v1"
+    payload:
+      type: object
+      required: [supplier_id, event_subtype, occurred_at]
+      properties:
+        supplier_id: {type: string, format: uuid}
+        event_subtype:
+          type: string
+          enum: [created, onboarded, status_changed, scorecard_updated, certification_expiring, certification_expired, risk_tier_changed, disqualified]
+        previous_state: {type: object}
+        new_state: {type: object}
+        changed_by: {type: string, format: uuid}
+        reason: {type: string}
+        occurred_at: {type: string, format: date-time}
+
+  # ---------------------------------------------------------------------------
+  # ERP INTEGRATION EVENT (inbound from ERP connectors)
+  # Topic: scvri.ingestion.erp_events
+  # ---------------------------------------------------------------------------
+  ERPIngestEvent:
+    event_type: "scvri.ingestion.erp_event.v1"
+    payload:
+      type: object
+      required: [source_system, erp_event_type, tenant_id, payload_hash, raw_payload]
+      properties:
+        source_system: {type: string, enum: [sap_s4hana, oracle_erp, msdynamics365, sap_ariba, coupa, generic_rest, edifact, ansi_x12]}
+        erp_event_type:
+          type: string
+          enum: [po_created, po_updated, po_cancelled, grn_created, invoice_received, supplier_master_updated, asn_received]
+        source_document_id: {type: string}
+        payload_hash: {type: string, description: "SHA-256 of raw_payload for idempotency check"}
+        raw_payload: {type: object}
+        received_at: {type: string, format: date-time}
+        erp_timestamp: {type: string, format: date-time}
+
+  # ---------------------------------------------------------------------------
+  # DEAD LETTER EVENT
+  # Topic: scvri.dlq.*
+  # ---------------------------------------------------------------------------
+  DeadLetterEvent:
+    event_type: "scvri.dlq.event.v1"
+    payload:
+      type: object
+      required: [original_topic, original_event_id, failure_reason, attempt_count, original_payload]
+      properties:
+        original_topic: {type: string}
+        original_partition: {type: integer}
+        original_offset: {type: integer}
+        original_event_id: {type: string, format: uuid}
+        original_event_type: {type: string}
+        failure_reason: {type: string}
+        failure_type: {type: string, enum: [schema_validation, processing_error, downstream_unavailable, timeout, duplicate]}
+        attempt_count: {type: integer}
+        first_failed_at: {type: string, format: date-time}
+        last_failed_at: {type: string, format: date-time}
+        original_payload: {type: object}
+        consumer_group: {type: string}
+        service_instance: {type: string}
+
+---
+# =============================================================================
+# CONSUMER GROUP FAILURE HANDLING
+# =============================================================================
+retry_strategy:
+  default:
+    max_attempts: 3
+    initial_delay_ms: 1000
+    backoff_multiplier: 2.0
+    max_delay_ms: 30000
+    jitter: true
+    dlq_topic_suffix: ".dlq"
+
+  iot_telemetry:                     # High volume — fail fast
+    max_attempts: 2
+    initial_delay_ms: 500
+    dlq_topic: "scvri.dlq.ingestion_errors"
+
+  notification_service:              # Alert delivery — aggressive retry
+    max_attempts: 5
+    initial_delay_ms: 2000
+    backoff_multiplier: 1.5
+    max_delay_ms: 60000
+    provider_fallback_on_attempt: 3  # Switch from primary to fallback provider
+    dlq_topic: "scvri.dlq.notification_failures"
+
+  erp_connector:                     # Exactly-once; transactional retry
+    max_attempts: 5
+    initial_delay_ms: 5000
+    backoff_multiplier: 2.0
+    idempotency_key: "payload_hash"
+    dlq_topic: "scvri.dlq.ingestion_errors"
+
+---
+# =============================================================================
+# BACKPRESSURE HANDLING
+# =============================================================================
+backpressure:
+  consumer_lag_thresholds:
+    warning: 50000     # events
+    critical: 500000   # events → trigger auto-scaling of consumer pods
+
+  producer_config:
+    # linger.ms + batch.size tuning for throughput vs latency tradeoff
+    linger_ms: 5                    # batch window
+    batch_size_bytes: 65536         # 64KB batch
+    buffer_memory_bytes: 33554432   # 32MB producer buffer
+    compression_type: lz4
+    acks: all                       # all in-sync replicas must ack
+    retries: 2147483647             # INT_MAX (rely on delivery.timeout.ms)
+    delivery_timeout_ms: 120000     # 2 minute total delivery timeout
+    enable_idempotence: true        # exactly-once producer semantics
+
+  consumer_config:
+    max_poll_records: 500           # batch size per poll
+    fetch_min_bytes: 1024           # 1KB minimum fetch
+    fetch_max_wait_ms: 500
+    session_timeout_ms: 45000
+    heartbeat_interval_ms: 3000
+    auto_offset_reset: earliest     # replay from beginning if no committed offset
+
+---
+# =============================================================================
+# KAFKA CONNECT SINKS
+# =============================================================================
+connectors:
+  - name: clickhouse-kri-sink
+    connector_class: com.clickhouse.kafka.connect.ClickHouseSinkConnector
+    topics: "scvri.analytics.kri_stream,scvri.analytics.spend_at_risk_stream"
+    click_house_url: "${CLICKHOUSE_URL}"
+    database: scvri_analytics
+    transforms: "tenantRoute"
+    transforms.tenantRoute.type: org.apache.kafka.connect.transforms.ReplaceField$Value
+    batch_size: 10000
+    flush_interval_ms: 5000
+
+  - name: s3-audit-archive-sink
+    connector_class: io.confluent.connect.s3.S3SinkConnector
+    topics: "scvri.audit.user_actions"
+    s3.bucket.name: "${S3_AUDIT_BUCKET}"
+    s3.part.size: 67108864           # 64MB parts
+    flush.size: 100000
+    rotate.interval.ms: 3600000      # 1 hour rotation
+    storage.class: io.confluent.connect.s3.storage.S3Storage
+    format.class: io.confluent.connect.s3.format.parquet.ParquetFormat
+    locale: en_US
+    timezone: UTC
+    # S3 bucket has Object Lock (WORM) enabled for immutable audit evidence
+
+  - name: elasticsearch-supplier-sink
+    connector_class: io.confluent.connect.elasticsearch.ElasticsearchSinkConnector
+    topics: "scvri.supplier.lifecycle_events"
+    connection.url: "${ELASTICSEARCH_URL}"
+    type.name: supplier_events
+    key.ignore: false
+    schema.ignore: true
+
+# =============================================================================
+# TOPIC PARTITION STRATEGY — RATIONALE
+# =============================================================================
+# All topics partitioned by tenant_id (message key = tenant_id)
+# This ensures:
+#   1. All events for a tenant go to same partition set (ordering per tenant)
+#   2. Consumer scaling: each pod handles N partitions
+#   3. Cross-tenant isolation at message routing level
+#
+# For IoT telemetry: key = tenant_id:shipment_id
+#   - Ensures sensor events for same shipment are ordered
+#   - 128 partitions supports 10,000 concurrent active shipments per tenant
+#
+# TOTAL PARTITION COUNT: 64+96+128+32+32+48+16+48+16+32+32+16+16+32+8+8+8+16+8 = 706
+# At 6 brokers: ~117 partitions/broker — well within limits (10,000/broker max)

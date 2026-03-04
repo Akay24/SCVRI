@@ -1,0 +1,64 @@
+name: CI — Shared Library
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "shared/**"
+      - ".github/workflows/ci-shared.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "shared/**"
+      - ".github/workflows/ci-shared.yml"
+
+concurrency:
+  group: ci-shared-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    name: Lint, Type-check & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: shared
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          poetry install --with dev
+
+      - name: ruff — lint
+        run: poetry run ruff check src/ tests/
+
+      - name: ruff — format check
+        run: poetry run ruff format --check src/ tests/
+
+      - name: mypy — type-check
+        run: poetry run mypy src/
+
+      - name: pytest
+        run: |
+          poetry run pytest tests/ \
+            --cov=src \
+            --cov-report=xml \
+            --cov-fail-under=80 \
+            -v --tb=short
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-shared-${{ github.run_id }}
+          path: shared/coverage.xml
+          retention-days: 7

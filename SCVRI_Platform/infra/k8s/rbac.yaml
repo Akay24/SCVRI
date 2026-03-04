@@ -1,0 +1,257 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# RBAC — Roles and RoleBindings for SCVRI service accounts
+# Principle of least privilege: each service reads only the Secrets/ConfigMaps
+# it actually needs; no service has write access to any namespace resource.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════════════
+# SHARED ROLES
+# ════════════════════════════════════════════════════════════════════════════
+
+# Role: read scvri-common ConfigMap (shared by all services)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scvri-common-configmap-reader
+  namespace: scvri
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["scvri-common"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ════════════════════════════════════════════════════════════════════════════
+# IAM SERVICE
+# ════════════════════════════════════════════════════════════════════════════
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scvri-iam-role
+  namespace: scvri
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      - scvri-common
+      - scvri-iam-config
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - scvri-postgres-secret
+      - scvri-redis-secret
+      - scvri-iam-keys
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scvri-iam-rolebinding
+  namespace: scvri
+subjects:
+  - kind: ServiceAccount
+    name: scvri-iam
+    namespace: scvri
+roleRef:
+  kind: Role
+  name: scvri-iam-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ════════════════════════════════════════════════════════════════════════════
+# SUPPLIER MANAGEMENT SERVICE
+# ════════════════════════════════════════════════════════════════════════════
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scvri-supplier-role
+  namespace: scvri
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      - scvri-common
+      - scvri-supplier-config
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - scvri-postgres-secret
+      - scvri-redis-secret
+      - scvri-iam-keys
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scvri-supplier-rolebinding
+  namespace: scvri
+subjects:
+  - kind: ServiceAccount
+    name: scvri-supplier-management
+    namespace: scvri
+roleRef:
+  kind: Role
+  name: scvri-supplier-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ════════════════════════════════════════════════════════════════════════════
+# RISK INTELLIGENCE SERVICE
+# ════════════════════════════════════════════════════════════════════════════
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scvri-risk-role
+  namespace: scvri
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      - scvri-common
+      - scvri-risk-config
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - scvri-postgres-secret
+      - scvri-redis-secret
+      - scvri-iam-keys
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scvri-risk-rolebinding
+  namespace: scvri
+subjects:
+  - kind: ServiceAccount
+    name: scvri-risk-intelligence
+    namespace: scvri
+roleRef:
+  kind: Role
+  name: scvri-risk-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ════════════════════════════════════════════════════════════════════════════
+# VISIBILITY SERVICE
+# ════════════════════════════════════════════════════════════════════════════
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scvri-visibility-role
+  namespace: scvri
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      - scvri-common
+      - scvri-visibility-config
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - scvri-postgres-secret
+      - scvri-redis-secret
+      - scvri-iam-keys
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scvri-visibility-rolebinding
+  namespace: scvri
+subjects:
+  - kind: ServiceAccount
+    name: scvri-visibility
+    namespace: scvri
+roleRef:
+  kind: Role
+  name: scvri-visibility-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ════════════════════════════════════════════════════════════════════════════
+# ALERT ENGINE SERVICE
+# ════════════════════════════════════════════════════════════════════════════
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scvri-alert-role
+  namespace: scvri
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      - scvri-common
+      - scvri-alert-config
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - scvri-postgres-secret
+      - scvri-redis-secret
+      - scvri-iam-keys
+      - scvri-alert-secret
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scvri-alert-rolebinding
+  namespace: scvri
+subjects:
+  - kind: ServiceAccount
+    name: scvri-alert-engine
+    namespace: scvri
+roleRef:
+  kind: Role
+  name: scvri-alert-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ════════════════════════════════════════════════════════════════════════════
+# INTEGRATION LAYER SERVICE
+# ════════════════════════════════════════════════════════════════════════════
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scvri-integration-role
+  namespace: scvri
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames:
+      - scvri-common
+      - scvri-integration-config
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - scvri-postgres-secret
+      - scvri-redis-secret
+      - scvri-iam-keys
+      - scvri-integration-secret
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scvri-integration-rolebinding
+  namespace: scvri
+subjects:
+  - kind: ServiceAccount
+    name: scvri-integration
+    namespace: scvri
+roleRef:
+  kind: Role
+  name: scvri-integration-role
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,23 @@
+# SCVRI Platform — Code Owners
+# Syntax: <pattern> <owner> [<owner> ...]
+# Owners are automatically requested for review when the pattern is changed.
+
+# ── Catch-all: platform team reviews all changes ─────────────────────────────
+*                               @scvri/platform-team
+
+# ── Shared library — requires core team sign-off ─────────────────────────────
+/shared/                        @scvri/platform-team @scvri/core-team
+
+# ── Service owners ────────────────────────────────────────────────────────────
+/services/iam/                  @scvri/iam-team
+/services/supplier-management/  @scvri/supplier-team
+/services/risk-intelligence/    @scvri/risk-team
+/services/visibility/           @scvri/visibility-team
+/services/alert-engine/         @scvri/alert-team
+/services/integration/          @scvri/integration-team
+
+# ── Infrastructure — DevOps team ──────────────────────────────────────────────
+/infra/                         @scvri/devops-team
+/.github/                       @scvri/devops-team
+/Makefile                       @scvri/devops-team
+/docker-compose.dev.yml         @scvri/devops-team

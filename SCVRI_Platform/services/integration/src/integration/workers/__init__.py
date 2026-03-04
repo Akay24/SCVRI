@@ -1,0 +1,1 @@
+"""Integration service Celery workers."""

@@ -1,0 +1,835 @@
+# =============================================================================
+# SCVRI Platform — Risk Intelligence Engine
+# Module: 03_services/risk_intelligence_engine
+# Language: Python 3.12 / FastAPI + Celery workers
+# SRS Coverage: RISK-FR-001..013, NFR-PERF-004 (< 60s risk score refresh)
+# =============================================================================
+
+service:
+  name: risk-intelligence-engine
+  components:
+    - api_server          # FastAPI REST
+    - scoring_worker      # Celery workers for ML inference
+    - nlp_pipeline        # Dedicated NLP processing workers
+    - drift_monitor       # Background drift detection scheduler
+    - retraining_trigger  # Model retraining trigger logic
+
+# =============================================================================
+# 1. RESPONSIBILITIES
+# =============================================================================
+responsibilities:
+  - Compute composite risk scores (0-100) for all active suppliers every 24h (RISK-FR-001)
+  - Decompose scores into 7 dimensions with SHAP explainability (RISK-FR-002)
+  - Ingest and process 15+ external data feeds (RISK-FR-003)
+  - Run NLP pipeline on news/social content for disruption classification (RISK-FR-004)
+  - Maintain global risk heatmap data (RISK-FR-005)
+  - Detect single-source and geographic concentration risk (RISK-FR-006)
+  - Generate 30/90-day predictive risk forecasts (RISK-FR-007)
+  - Support custom risk model weight configuration per tenant (RISK-FR-008)
+  - Monitor supplier financial health via credit/bankruptcy signals (RISK-FR-009)
+  - Score ESG risk (carbon, labor, governance, violations) (RISK-FR-010)
+  - Power scenario simulation engine (RISK-FR-011)
+  - Maintain risk event log with full audit trail (RISK-FR-012)
+  - Recommend alternate suppliers when risk crosses critical threshold (RISK-FR-013)
+
+# =============================================================================
+# 2. ML MODEL ARCHITECTURE
+# =============================================================================
+ml_models:
+
+  # ---------------------------------------------------------------------------
+  # Model 1: Composite Risk Scorer (Ensemble)
+  # RISK-FR-001, RISK-FR-002
+  # ---------------------------------------------------------------------------
+  composite_risk_scorer:
+    name: scvri-risk-scorer
+    type: ensemble
+    base_models:
+      - model_type: xgboost
+        purpose: structured_features  # financial ratios, delivery KPIs, cert status
+        feature_count: 87
+        output: probability_per_dimension
+      - model_type: neural_network
+        architecture: tabnet          # TabNet for handling missing values in supplier data
+        purpose: interaction_effects  # captures non-linear risk factor interactions
+    ensemble_strategy: weighted_stacking   # meta-learner combines base model outputs
+    output:
+      - composite_score: float [0, 100]
+      - dimension_scores: {financial, operational, geopolitical, esg, concentration, cyber, natural_hazard}
+      - shap_values: per_feature SHAP contributions (top 10 features surfaced to users)
+
+    features:
+      financial:
+        - dnb_credit_score
+        - dnb_failure_score
+        - dnb_paydex_score
+        - days_sales_outstanding_trend
+        - current_ratio
+        - debt_to_equity
+        - revenue_growth_3y
+        - bankruptcy_filing_flag
+        - credit_watch_flag
+
+      operational:
+        - otd_rate_90d
+        - defect_rate_90d
+        - fill_rate_90d
+        - lead_time_variance_30d
+        - capacity_utilization_pct
+        - active_quality_holds
+        - days_since_last_audit
+        - cert_expiry_days_min      # nearest expiring certification
+        - open_corrective_actions
+
+      geopolitical:
+        - country_risk_score_primary  # from Refinitiv/ACAPS
+        - country_risk_score_secondary
+        - trade_restriction_flag
+        - sanctions_flag
+        - tariff_change_flag
+        - political_stability_index
+        - conflict_proximity_km
+
+      esg:
+        - esg_overall_score           # Refinitiv ESG
+        - carbon_intensity_ratio
+        - labor_rights_violations_flag
+        - governance_score
+        - env_regulatory_violations_count
+        - diversity_score
+        - supply_chain_esg_transparency_flag
+
+      concentration:
+        - single_source_flag
+        - supplier_spend_pct_of_category  # spend concentration
+        - supplier_count_same_country_category
+        - geographic_concentration_hhi    # Herfindahl-Hirschman Index
+        - transport_lane_concentration
+
+      cyber:
+        - bitsight_security_rating
+        - known_breach_flag
+        - patch_cadence_score
+        - third_party_cyber_rating
+
+      natural_hazard:
+        - flood_risk_percentile         # facility lat/lng → climate risk model
+        - earthquake_risk_percentile
+        - hurricane_risk_percentile
+        - wildfire_risk_percentile
+        - proximity_to_seismic_zone_km
+
+    training:
+      dataset_size_min: 50000_supplier_observations
+      label_source: historical_disruption_events + analyst_labels
+      train_test_split: 80/20
+      cross_validation: 5-fold stratified by industry
+      evaluation_metrics:
+        - auc_roc: target >= 0.85
+        - precision_at_k: k=10, target >= 0.80
+        - brier_score: target <= 0.15
+        - calibration_curve: ensure score percentiles match empirical disruption rates
+      retraining_schedule: weekly (every Monday 02:00 UTC)
+      retraining_triggers:
+        - stp_rate_drop: threshold = -5% from 30d baseline
+        - psi_breach: Population Stability Index > 0.2 (data drift)
+        - manual: via ML engineer API call
+        - new_labeled_data: >= 5000 new labeled samples available
+
+    drift_detection:
+      method: PSI (Population Stability Index) on feature distributions
+      baseline_window: 30 days
+      check_frequency: daily (03:00 UTC)
+      psi_threshold:
+        warning: 0.1
+        critical: 0.2       # triggers retraining
+      monitored_features:
+        - dnb_credit_score
+        - otd_rate_90d
+        - composite_score_distribution
+      output_drift:
+        method: KS test on score distribution per industry segment
+        threshold: p_value < 0.05
+
+    bias_monitoring:
+      protected_attributes: [country_code, industry_sector, company_size_tier]
+      metrics:
+        - demographic_parity_difference: |P(high_risk|country=X) - P(high_risk|country=Y)| <= 0.1
+        - equalized_odds: per industry sector
+      check_frequency: weekly
+      alert_if_breach: true
+      report_owner: ML_Lead + Compliance team
+
+    explainability:
+      method: SHAP (TreeExplainer for XGBoost, KernelExplainer for NN)
+      outputs:
+        - shap_values stored in risk.supplier_risk_scores.shap_factors (top 10 features)
+        - global_feature_importance: updated per model version, stored in MLflow
+        - natural_language_explanation: templated string generated from top SHAP factors
+      latency_budget: SHAP computation adds < 100ms per supplier (TreeExplainer is fast)
+
+  # ---------------------------------------------------------------------------
+  # Model 2: NLP Intelligence Pipeline
+  # RISK-FR-004
+  # ---------------------------------------------------------------------------
+  nlp_pipeline:
+    name: scvri-nlp-intelligence
+    architecture: fine_tuned_bert_base  # BERT-base fine-tuned on supply chain corpus
+    tasks:
+      news_classification:
+        labels: [supply_disruption, financial_distress, geopolitical, esg_event, logistics_delay, irrelevant]
+        confidence_threshold: 0.7       # < 0.7 → labeled 'needs_review'
+      entity_extraction:
+        types: [company_name, country, commodity, port, event_type, severity]
+        model: spacy_transformer + custom NER head
+      severity_scoring:
+        output: float [0, 1]
+        method: regression head on [CLS] token embedding
+
+    serving:
+      framework: torchserve
+      hardware: GPU (NVIDIA T4, g4dn.xlarge) for batched inference
+      batch_size: 32
+      max_latency_ms: 2000           # 2s for batch NLP
+      queue_max_size: 10000          # back-pressure limit
+      replicas: 3 (autoscale to 10)
+
+    pipeline_steps:
+      1. fetch_raw_articles: consume from scvri.ingestion.news_nlp_raw
+      2. preprocess: tokenize, truncate to 512 tokens, clean HTML
+      3. classify: BERT classifier → label + confidence
+      4. filter: drop irrelevant (label=irrelevant OR confidence < 0.5)
+      5. extract_entities: NER → companies, geographies, commodities
+      6. match_to_suppliers: fuzzy match extracted company names to supplier master (pg_trgm)
+      7. score_severity: regression head → 0-1 severity
+      8. emit: scvri.risk.intelligence_events (if matched_suppliers >= 1)
+      9. archive: store in risk.external_intelligence table
+
+  # ---------------------------------------------------------------------------
+  # Model 3: Predictive Disruption Forecaster
+  # RISK-FR-007: 30-day and 90-day horizons with confidence intervals
+  # ---------------------------------------------------------------------------
+  predictive_forecaster:
+    name: scvri-disruption-forecaster
+    models:
+      - type: prophet
+        purpose: trend_seasonality   # handles weekly/monthly seasonality in disruption patterns
+        horizon_days: [30, 90]
+      - type: lstm
+        architecture: bidirectional_lstm_2layer_128h
+        purpose: sequence_patterns   # captures sequential risk escalation patterns
+        sequence_length: 90           # 90 days of historical scores as input
+        horizon_days: [30, 90]
+    ensemble: simple_average_of_quantile_forecasts
+    output:
+      - predicted_composite_score: per horizon
+      - confidence_interval_lower_90: 5th percentile
+      - confidence_interval_upper_90: 95th percentile
+    retraining: weekly (same schedule as scorer)
+    evaluation: MAPE <= 15%, Coverage of CI >= 85%
+
+# =============================================================================
+# 3. SCORING PIPELINE — EXECUTION FLOW
+# =============================================================================
+scoring_pipeline:
+  # Trigger 1: Scheduled (every 24h, satisfies RISK-FR-001 minimum)
+  # Trigger 2: Event-driven (incoming intelligence event affecting supplier)
+  # Trigger 3: Manual (ML engineer API)
+
+  steps:
+    1_fetch_suppliers:
+      description: Query all active suppliers for tenant needing re-score
+      query: >
+        SELECT s.supplier_id, s.tenant_id FROM supply.suppliers s
+        LEFT JOIN risk.supplier_risk_scores r ON r.supplier_id = s.supplier_id
+          AND r.scored_at = (SELECT MAX(scored_at) FROM risk.supplier_risk_scores WHERE supplier_id = s.supplier_id)
+        WHERE s.status = 'active'
+          AND (r.scored_at IS NULL OR r.scored_at < now() - INTERVAL '23 hours')
+        ORDER BY (CASE WHEN r.scored_at IS NULL THEN 0 ELSE 1 END), r.scored_at ASC
+      batch_size: 500                 # Process 500 suppliers per worker batch
+
+    2_fetch_features:
+      sources:
+        - PostgreSQL: scorecard KPIs, certification status, PO/shipment stats
+        - Redis cache: pre-computed feature cache (TTL 1h)
+        - External API cache (PostgreSQL): D&B scores, Refinitiv ESG (refreshed daily)
+      feature_cache:
+        key: "features:{supplier_id}:{date}"
+        ttl: 3600s
+        fallback: last_known_value with staleness flag
+
+    3_run_inference:
+      parallelism: 16 Celery workers × 4 vCPU = 64 parallel inferences
+      throughput: ~50 suppliers/second
+      time_for_10000_suppliers: 200s (3.3 min) — well within 24h SLA
+      hardware: CPU-optimized (XGBoost), no GPU required for inference
+
+    4_compute_shap:
+      method: TreeExplainer (< 100ms per supplier)
+      output: top 10 SHAP features stored in JSON
+
+    5_write_scores:
+      target: risk.supplier_risk_scores (upsert by supplier_id + scored_at)
+      also_write: risk.risk_score_history (append)
+
+    6_emit_events:
+      target: scvri.risk.score_updated_events
+      condition: always (alert engine evaluates delta threshold)
+
+    7_update_alerts:
+      downstream: Alert Engine consumes scvri.risk.score_updated_events
+      sla: event-to-alert evaluation < 15s → within 60s end-to-end NFR-PERF-004
+
+# =============================================================================
+# 4. REST API SPECIFICATION
+# =============================================================================
+api:
+  base_path: /api/v1/risk
+  auth: bearer_jwt + tenant_context
+  rate_limit: 500 req/min per tenant
+
+  endpoints:
+
+    - method: GET
+      path: /suppliers/{supplier_id}/risk-score
+      description: Current risk score with SHAP explainability breakdown
+      response:
+        type: object
+        properties:
+          supplier_id: {type: string, format: uuid}
+          composite_score: {type: number}
+          risk_level: {type: string, enum: [critical, high, medium, low]}
+          dimension_scores: {type: object}
+          top_contributing_factors:
+            type: array
+            maxItems: 10
+            items:
+              type: object
+              properties:
+                factor_name: {type: string}
+                dimension: {type: string}
+                shap_value: {type: number}
+                direction: {type: string}
+                natural_language: {type: string}
+                source_data: {type: string}
+          forecast:
+            type: object
+            properties:
+              day_30: {type: object, properties: {predicted: {type: number}, ci_lower: {type: number}, ci_upper: {type: number}}}
+              day_90: {type: object, properties: {predicted: {type: number}, ci_lower: {type: number}, ci_upper: {type: number}}}
+          is_overridden: {type: boolean}
+          override_details: {type: object, nullable: true}
+          scored_at: {type: string, format: date-time}
+          is_stale: {type: boolean}
+          model_version: {type: string}
+
+    - method: GET
+      path: /suppliers/{supplier_id}/risk-history
+      query_params:
+        - name: from_date
+          type: string
+          format: date
+        - name: to_date
+          type: string
+          format: date
+        - name: interval
+          type: string
+          enum: [daily, weekly]
+          default: daily
+      response:
+        type: array
+        items:
+          type: object
+          properties:
+            scored_at: {type: string, format: date-time}
+            composite_score: {type: number}
+            model_version: {type: string}
+      caching:
+        strategy: redis_cache
+        ttl_seconds: 3600
+        key_template: "rh:{tenant_id}:{supplier_id}:{from}:{to}:{interval}"
+
+    - method: GET
+      path: /heatmap
+      description: Global risk heatmap (RISK-FR-005)
+      query_params:
+        - name: group_by
+          type: string
+          enum: [country, region, category]
+          default: country
+        - name: min_score
+          type: number
+          default: 0
+      response:
+        type: array
+        items:
+          type: object
+          properties:
+            country_code: {type: string}
+            avg_risk_score: {type: number}
+            max_risk_score: {type: number}
+            supplier_count: {type: integer}
+            high_risk_supplier_count: {type: integer}
+            active_disruption_count: {type: integer}
+            total_spend_usd: {type: number}
+      caching:
+        strategy: redis_cache
+        ttl_seconds: 300
+        key_template: "heatmap:{tenant_id}:{group_by}"
+
+    - method: GET
+      path: /concentration-risk
+      description: Single-source and geographic concentration risk (RISK-FR-006)
+      response:
+        type: object
+        properties:
+          single_source_suppliers:
+            type: array
+            items:
+              type: object
+              properties:
+                supplier_id: {type: string, format: uuid}
+                supplier_name: {type: string}
+                category: {type: string}
+                spend_pct_of_category: {type: number}
+                fallback_suppliers_available: {type: integer}
+          geographic_concentration:
+            type: array
+            items:
+              type: object
+              properties:
+                country_code: {type: string}
+                category: {type: string}
+                supplier_count: {type: integer}
+                spend_pct: {type: number}
+                hhi_score: {type: number}
+          category_concentration:
+            type: array
+            items: {type: object}
+
+    - method: POST
+      path: /suppliers/{supplier_id}/risk-score/override
+      description: Human override of AI risk score (AI Governance requirement)
+      request_body:
+        required: true
+        type: object
+        properties:
+          override_score:
+            type: number
+            minimum: 0
+            maximum: 100
+            required: true
+          reason:
+            type: string
+            minLength: 20
+            required: true
+          valid_until:
+            type: string
+            format: date-time
+            description: Override expires at this time; system resumes AI scoring
+            required: true
+      response:
+        type: object
+        properties:
+          score_id: {type: string, format: uuid}
+          override_applied: {type: boolean}
+          effective_at: {type: string, format: date-time}
+      audit: true
+      required_role: risk_analyst
+
+    - method: POST
+      path: /scenarios/simulate
+      description: Scenario simulation (RISK-FR-011)
+      request_body:
+        type: object
+        properties:
+          scenario_name: {type: string, required: true}
+          disruption_type:
+            type: string
+            enum: [supplier_failure, port_closure, regional_conflict, natural_disaster, logistic_delay, tariff_increase]
+            required: true
+          affected_supplier_ids: {type: array, items: {type: string, format: uuid}}
+          affected_countries: {type: array, items: {type: string}}
+          severity: {type: string, enum: [partial, full]}
+          duration_days: {type: integer, required: true}
+      response:
+        type: object
+        properties:
+          scenario_id: {type: string, format: uuid}
+          impacted_pos: {type: integer}
+          impacted_skus: {type: integer}
+          spend_at_risk_usd: {type: number}
+          lead_time_impact_days_avg: {type: number}
+          alternate_suppliers:
+            type: array
+            items:
+              type: object
+              properties:
+                supplier_id: {type: string, format: uuid}
+                supplier_name: {type: string}
+                category: {type: string}
+                risk_score: {type: number}
+                current_lead_time_days: {type: number}
+                capacity_utilization_pct: {type: number}
+                onboarding_required: {type: boolean}
+          financial_impact_estimate_usd: {type: number}
+          confidence: {type: number}
+      caching:
+        strategy: none              # always fresh; user-initiated, not spammable
+      rate_limit_per_user: 10/hour
+
+    - method: GET
+      path: /intelligence-feed
+      description: Processed external intelligence events (RISK-FR-003)
+      query_params:
+        - name: severity
+          type: array[string]
+        - name: source
+          type: array[string]
+        - name: supplier_id
+          type: uuid
+        - name: country_codes
+          type: array[string]
+        - name: from_time
+          type: string
+          format: date-time
+        - name: page
+          type: integer
+          default: 1
+        - name: page_size
+          type: integer
+          default: 50
+      response:
+        type: object
+        properties:
+          items: {type: array, items: {$ref: IntelligenceEvent}}
+          total: {type: integer}
+      caching:
+        strategy: redis_cache
+        ttl_seconds: 60
+        key_template: "intel:{tenant_id}:{filter_hash}"
+
+    - method: PUT
+      path: /risk-models/config
+      description: Custom risk model weight configuration (RISK-FR-008)
+      request_body:
+        type: object
+        properties:
+          segment:
+            type: string
+            description: Supplier segment to apply custom weights to
+          dimension_weights:
+            type: object
+            properties:
+              financial: {type: number, minimum: 0, maximum: 1}
+              operational: {type: number, minimum: 0, maximum: 1}
+              geopolitical: {type: number, minimum: 0, maximum: 1}
+              esg: {type: number, minimum: 0, maximum: 1}
+              concentration: {type: number, minimum: 0, maximum: 1}
+              cyber: {type: number, minimum: 0, maximum: 1}
+              natural_hazard: {type: number, minimum: 0, maximum: 1}
+            additionalProperties: false
+            description: Weights must sum to 1.0
+      validation: sum(weights) == 1.0; else 400 Bad Request
+      required_role: risk_analyst
+      audit: true
+
+    - method: GET
+      path: /suppliers/{supplier_id}/alternate-suppliers
+      description: Recommended alternates when primary supplier risk critical (RISK-FR-013)
+      response:
+        type: array
+        items:
+          type: object
+          properties:
+            supplier_id: {type: string, format: uuid}
+            match_score: {type: number}
+            risk_score: {type: number}
+            matching_categories: {type: array}
+            current_lead_time_days: {type: number}
+            qualifications: {type: array}
+            onboarded: {type: boolean}
+
+# =============================================================================
+# 5. EXTERNAL DATA FEED REGISTRY
+# =============================================================================
+external_data_feeds:
+  - name: dnb_credit
+    provider: Dun & Bradstreet
+    data: credit_score, failure_score, paydex, bankruptcy_filings
+    refresh_interval: daily (02:00 UTC)
+    circuit_breaker: 5 failures → open; retry every 5 min
+    fallback: last_known_value with staleness flag
+    auth: OAuth 2.0 / API key (stored in Secrets Manager)
+    rate_limit: 10,000 req/day
+    dlq: scvri.dlq.ingestion_errors
+
+  - name: refinitiv_esg
+    provider: Refinitiv / LSEG
+    data: esg_score, environmental_score, social_score, governance_score, controversies
+    refresh_interval: daily
+    circuit_breaker: enabled
+    fallback: last_known_value
+
+  - name: refinitiv_news
+    provider: Refinitiv Newsroom API
+    data: news articles (supply chain category)
+    refresh_interval: every 15 min
+    processing: route to scvri.ingestion.news_nlp_raw → NLP pipeline
+    volume: ~5,000 articles/day
+
+  - name: weather_events
+    provider: IBM Weather Company / OpenWeatherMap severe weather
+    data: hurricane tracks, flood warnings, earthquake alerts
+    refresh_interval: every 30 min
+    circuit_breaker: enabled
+
+  - name: port_congestion
+    provider: project44 / Descartes port intelligence
+    data: port_congestion_index, port_dwell_time_avg, berth_availability
+    refresh_interval: every 6 hours
+
+  - name: geopolitical_risk
+    provider: Verisk Maplecroft / ACAPS
+    data: country_risk_scores, trade_restriction_flags, sanctions_lists
+    refresh_interval: daily
+
+  - name: sanctions_lists
+    provider: OFAC SDN, EU Consolidated, UN Sanctions
+    data: sanctioned entities, vessel names, DUNS matches
+    refresh_interval: every 6 hours
+    criticality: HIGH (compliance requirement)
+
+  - name: financial_filings
+    provider: SEC EDGAR, Companies House (UK), Bundesanzeiger (DE)
+    data: 10-K, 10-Q, annual reports, credit watch changes
+    refresh_interval: daily
+
+  - name: weather_climate_risk
+    provider: Jupiter Intelligence
+    data: physical_climate_risk_scores per facility lat/lng
+    refresh_interval: monthly (scores change slowly)
+
+  - name: bitsight_cyber
+    provider: BitSight Technologies
+    data: security_rating, breach_notifications, open_ports
+    refresh_interval: daily
+
+  - name: un_comtrade
+    provider: UN Comtrade
+    data: trade flows, HS codes, country-level import/export data
+    refresh_interval: monthly
+
+  - name: carbon_databases
+    provider: CDP / Bloomberg ESG
+    data: carbon_intensity, scope1_scope2_emissions
+    refresh_interval: quarterly
+
+  - name: labor_risk
+    provider: Verisk Maplecroft Social Risk Index
+    data: forced_labor_risk, child_labor_risk, union_relations
+    refresh_interval: quarterly
+
+  - name: news_social_custom
+    provider: Google News API + custom RSS feeds
+    data: general news routed to NLP pipeline
+    refresh_interval: every 15 min
+    volume: ~10,000 articles/day
+
+  - name: vessel_tracking
+    provider: MarineTraffic / FleetMon
+    data: vessel positions, ETA updates, port calls
+    refresh_interval: every 30 min
+
+  # TOTAL: 15 feeds — satisfies RISK-FR-003
+
+# =============================================================================
+# 6. SCALING MODEL
+# =============================================================================
+scaling:
+  scoring_workers:
+    min_replicas: 4
+    max_replicas: 24
+    celery_concurrency: 16         # 16 threads per worker pod
+    scale_metric: celery_queue_depth
+    scale_threshold: 200           # pending tasks
+    resource_requests: {cpu: "2000m", memory: "4Gi"}
+    resource_limits: {cpu: "4000m", memory: "8Gi"}
+
+  nlp_pipeline:
+    min_replicas: 3
+    max_replicas: 10
+    hardware: GPU (NVIDIA T4)      # GPU node pool
+    scale_metric: kafka_consumer_lag(nlp-pipeline)
+    scale_threshold: 2000
+    resource_requests: {cpu: "2000m", memory: "8Gi", nvidia.com/gpu: "1"}
+
+  api_server:
+    min_replicas: 3
+    max_replicas: 12
+    scale_metric: cpu
+    cpu_threshold: 65%
+
+# =============================================================================
+# 7. FAILURE MODES + RECOVERY
+# =============================================================================
+failure_modes:
+
+  - scenario: D&B API unavailable for > 24h
+    impact: Financial dimension score computed without fresh credit data (staleness)
+    detection: Circuit breaker OPEN; no credit data in feature cache for > 24h
+    recovery:
+      - Use last known D&B scores (up to 7 days stale)
+      - Flag financial_score with "data source stale" indicator in API response
+      - Alert ML ops team (P2)
+      - Reduce financial dimension weight by 30% (configurable fallback weight)
+      - Auto-resume when circuit breaker half-opens and D&B API probe succeeds
+
+  - scenario: ML model inference error (exception in scoring worker)
+    impact: Single supplier score computation fails
+    detection: Celery task failure counter > 10 in 5 min
+    recovery:
+      - Celery retries task up to 3 times with exponential backoff
+      - After 3 failures: log to DLQ + alert ops (P2 if > 100 fails/hour, P1 if > 1000)
+      - Retain previous risk score; set is_stale = TRUE after 25h
+      - UI shows staleness indicator with "Score refresh delayed" message
+
+  - scenario: Model performance regression (post-deployment)
+    detection: Drift monitor detects PSI > 0.2 OR AUC-ROC drop > 5% on evaluation set
+    recovery:
+      - Automatic rollback to previous MLflow model version (canary: roll back to stable)
+      - Alert ML team
+      - Trigger emergency retraining within 24h
+
+  - scenario: NLP pipeline GPU node failure
+    detection: Pod liveness probe fails; Kafka lag on nlp-pipeline consumer group spikes
+    recovery:
+      - Kubernetes reschedules pod to another GPU node (< 2 min)
+      - If no GPU nodes available: fallback to CPU inference (4× slower but functional)
+      - Backlog processed after recovery; new articles prioritized over backlog
+
+# =============================================================================
+# 8. CACHING STRATEGY
+# =============================================================================
+caching:
+  feature_cache:
+    key: "features:{supplier_id}:{date}"
+    ttl: 3600s
+    storage: redis_cluster
+    purpose: Avoid repeated DB queries when scoring thousands of suppliers
+
+  risk_score_cache:
+    key: "risk:{tenant_id}:{supplier_id}:current"
+    ttl: 300s
+    storage: redis_cluster
+    invalidation: on_score_updated_event
+
+  heatmap_cache:
+    key: "heatmap:{tenant_id}:{group_by}"
+    ttl: 300s
+    invalidation: on_bulk_score_run_complete
+
+  nlp_entity_cache:
+    key: "nlp:entities:{content_hash}"
+    ttl: 86400s                    # Deduplicate same article from multiple feeds
+
+# =============================================================================
+# 9. SECURITY CONTROLS
+# =============================================================================
+security:
+  ml_model_security:
+    model_artifacts_s3: server-side encrypted (AES-256 + KMS)
+    mlflow_registry: access restricted to ml_engineers + service_account_risk_engine
+    model_signing: SHA-256 checksum stored in MLflow metadata; verified at load time
+    feature_data: features fetched through app_user role (RLS enforced)
+
+  api_security:
+    risk_score_override:
+      required_role: risk_analyst
+      mfa_required: true (re-authentication within last 30 min)
+      audit_log: mandatory (action: "risk.score.override")
+    scenario_simulation:
+      required_role: risk_analyst || supply_chain_manager
+      rate_limit_per_user: 10/hour (expensive compute)
+
+  external_feed_credentials:
+    storage: AWS Secrets Manager
+    rotation: 90-day automatic rotation where provider supports it
+    access: risk-intelligence-engine service account only
+
+# =============================================================================
+# 10. OBSERVABILITY
+# =============================================================================
+observability:
+  metrics:
+    - name: risk_scores_computed_total
+      type: counter
+      labels: [tenant_id, trigger_type]
+    - name: risk_score_staleness_gauge
+      type: gauge
+      labels: [tenant_id]
+      description: Count of suppliers with stale scores (> 24h)
+      alert_threshold: > 100 (P2), > 1000 (P1)
+    - name: risk_scoring_duration_seconds
+      type: histogram
+      labels: [supplier_count_bucket]
+      buckets: [10, 50, 100, 500, 1000]
+    - name: nlp_inference_duration_ms
+      type: histogram
+      buckets: [100, 500, 1000, 2000, 5000]
+    - name: external_feed_last_successful_ingest_seconds
+      type: gauge
+      labels: [feed_name]
+      alert_threshold: > 86400s (24h without successful ingest → P2 alert)
+    - name: model_psi_score
+      type: gauge
+      labels: [model_name, feature_name]
+      alert_threshold_warning: 0.1
+      alert_threshold_critical: 0.2
+    - name: risk_score_overrides_total
+      type: counter
+      labels: [tenant_id, reason_category]
+    - name: mlmodel_auc_roc
+      type: gauge
+      labels: [model_name, model_version]
+
+# =============================================================================
+# 11. SRS TRACEABILITY
+# =============================================================================
+srs_traceability:
+  RISK-FR-001: composite_risk_scorer + scoring_pipeline (24h SLA, 7 dimensions)
+  RISK-FR-002: SHAP explainability → top 10 factors in API response + natural language
+  RISK-FR-003: 15 external_data_feeds defined with circuit breakers
+  RISK-FR-004: nlp_pipeline (BERT fine-tuned, severity scoring, entity extraction)
+  RISK-FR-005: GET /heatmap (country/region/category grouping)
+  RISK-FR-006: GET /concentration-risk (single_source + HHI geographic concentration)
+  RISK-FR-007: predictive_forecaster (30d/90d LSTM+Prophet with CI)
+  RISK-FR-008: PUT /risk-models/config (per-segment weight configuration)
+  RISK-FR-009: dnb_credit + financial_filings feeds + financial dimension in scorer
+  RISK-FR-010: refinitiv_esg + esg dimension in scorer
+  RISK-FR-011: POST /scenarios/simulate (disruption simulation engine)
+  RISK-FR-012: risk.risk_events table + audit.audit_log (all actions)
+  RISK-FR-013: GET /suppliers/{id}/alternate-suppliers (match_score + risk + onboarding)
+  NFR-PERF-004: scoring pipeline end-to-end < 60s (pipeline timing analysis above)
+
+# =============================================================================
+# 12. GAP DETECTION & FIXES
+# =============================================================================
+gaps_detected:
+  - gap: RISK-FR-008 (custom risk models) — custom weights applied per-query could diverge from stored scores
+    fix: Custom weights stored in tenant configuration (core.tenant_feature_flags).
+         Scoring pipeline reads weight config at runtime per tenant.
+         Scores stored with weight_config_hash for auditability.
+         Pre-built "standard" weights configuration always available as fallback.
+
+  - gap: RISK-FR-013 (alternate suppliers) — requires cross-tenant supplier data for recommendations
+    fix: Global supplier graph index maintained separately (aggregate view across all tenants
+         with tenant PII stripped). New suppliers added to global index at onboarding.
+         Recommendations ranked by: (1) same category match, (2) lowest risk score,
+         (3) geographic diversification from primary, (4) capacity availability.
+         Global index rebuilt nightly; does NOT expose other tenant's proprietary data.
+
+  - gap: Bias monitoring requires demographic data that may itself be PII
+    fix: Bias monitoring uses aggregate cohort analysis (country_code, industry_sector, company_size_tier
+         only), never individual-level PII. Population Stability Index computed at segment level.
+         Bias report accessible only to ML_Lead + Compliance roles.

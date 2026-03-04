@@ -1,0 +1,579 @@
+# =============================================================================
+# SCVRI Platform — Alerting & Escalation Engine
+# Module: 03_services/alert_engine
+# Language: Python 3.12 / FastAPI + Celery
+# SRS Coverage: ALERT-FR-001..008, NFR-PERF-005 (< 5 min critical alert delivery)
+# =============================================================================
+
+service:
+  name: alert-engine
+  components:
+    - rule_evaluator      # Kafka consumer evaluating rules against events
+    - escalation_manager  # Timer-based escalation scheduler
+    - notification_worker # Multi-channel delivery workers
+    - dedup_manager       # Alert deduplication
+
+# =============================================================================
+# 1. RESPONSIBILITIES
+# =============================================================================
+responsibilities:
+  - Evaluate all alert rules against incoming domain events in near-realtime
+  - Apply deduplication logic to prevent alert fatigue (ALERT-FR-006)
+  - Generate alerts with AI-recommended mitigation actions (ALERT-FR-007)
+  - Route alerts to multi-channel delivery (email, SMS, Slack, Teams, webhook, in-app)
+  - Enforce < 5 minute event-to-notification SLA for critical alerts (NFR-PERF-005)
+  - Escalate unacknowledged alerts per configurable escalation rules (ALERT-FR-004)
+  - Maintain complete alert audit trail (ALERT-FR-008)
+  - Provide alert inbox with workflow (ack, assign, resolve) (ALERT-FR-005)
+
+# =============================================================================
+# 2. ALERT DELIVERY SLA BUDGET (< 5 min for Critical alerts)
+# =============================================================================
+sla_budget:
+  target: 300 seconds (5 minutes) from event_detected_at to first_delivered
+  components:
+    event_to_kafka: 1s              # event published to triggering topic
+    kafka_consumer_poll: 2s         # consumer picks up event (max.poll.wait + processing)
+    rule_evaluation: 3s             # evaluate all tenant rules against event; Redis-cached rules
+    dedup_check: 1s                 # Redis SET NX check for dedup key
+    alert_write_to_db: 2s           # INSERT into alert.alerts
+    publish_to_alert_topic: 1s      # publish AlertGeneratedEvent to scvri.alerts.generated
+    notification_consumer_pick_up: 2s # notification worker polls alert topic
+    provider_api_call: 5s           # Email/Slack/SMS API call (P99)
+    provider_delivery: 30s          # End-to-end delivery (email servers, mobile push)
+    total_budget: 47s               # ~47s P50, worst-case ~3 min (well within 5 min)
+
+  critical_path_optimization:
+    - Rule cache in Redis (no DB query during evaluation)
+    - Kafka topic scvri.alerts.generated: lag_alert_threshold = 50 (near-realtime consumption)
+    - SMS and push notifications prioritized over email for critical severity
+    - Dedicated notification thread pool for critical alerts (no queuing behind low-severity)
+
+# =============================================================================
+# 3. RULE EVALUATION ENGINE
+# =============================================================================
+rule_evaluation:
+  input_topics:
+    - scvri.risk.score_updated_events    # ALERT-FR-001 (score delta >= 10)
+    - scvri.risk.intelligence_events     # External events triggering alerts
+    - scvri.visibility.shipment_events   # Shipment exceptions
+    - scvri.visibility.lead_time_deviation_events  # Lead time > threshold
+    - scvri.visibility.iot_breach_events # Cold chain violations
+    - scvri.visibility.po_lifecycle_events # PO status anomalies
+    - scvri.supplier.lifecycle_events    # Cert expiry, status changes
+
+  rule_engine:
+    type: CEP (Complex Event Processing)
+    rule_storage: Redis Hash (tenant_id → serialized rule set)
+    rule_cache_ttl: 60s              # Rules refreshed from DB every 60s
+    evaluation_model: per_event_per_tenant (each event evaluated against all active tenant rules)
+
+  rule_condition_operators:
+    - gt   (>)
+    - gte  (>=)
+    - lt   (<)
+    - lte  (<=)
+    - eq   (==)
+    - neq  (!=)
+    - in   (value in list)
+    - contains  (array/string contains)
+    - delta_gte (field increased by >= N in rolling window)
+    - percentile_breach (field < Nth percentile of 30d baseline)
+
+  # ALERT-FR-001: Score delta 10-point trigger (built-in system rule)
+  system_rules:
+    - rule_id: SYSTEM-001
+      name: "Supplier Risk Score Delta Alert"
+      conditions:
+        - field: composite_score_delta_24h
+          operator: delta_gte
+          value: 10
+      severity_mapping:
+        - delta >= 25: critical
+        - delta >= 15: high
+        - delta >= 10: medium
+      delivery_channels: [in_app, email]
+      escalation_config:
+        critical:
+          delay_minutes: 15
+          escalate_to_role: risk_analyst
+          then_delay_minutes: 30
+          then_to_role: supply_chain_manager
+
+    - rule_id: SYSTEM-002
+      name: "Supplier Certification Expiry"
+      trigger_topic: scvri.supplier.lifecycle_events
+      conditions:
+        - field: event_subtype
+          operator: eq
+          value: certification_expiring
+      severity_mapping:
+        - days_until_expiry <= 30: high
+        - days_until_expiry <= 60: medium
+        - days_until_expiry <= 90: low
+      delivery_channels: [in_app, email]
+
+    - rule_id: SYSTEM-003
+      name: "Critical Supplier Risk Score Threshold"
+      conditions:
+        - field: composite_score
+          operator: gte
+          value: 80
+      severity: critical
+      delivery_channels: [in_app, email, slack]
+      ai_mitigation: true
+
+    - rule_id: SYSTEM-004
+      name: "IoT Temperature Breach"
+      trigger_topic: scvri.visibility.iot_breach_events
+      conditions:
+        - field: sensor_type
+          operator: eq
+          value: temperature
+        - field: breach_direction
+          operator: in
+          value: [above, below]
+      severity: high
+      delivery_channels: [in_app, email, sms]
+
+    - rule_id: SYSTEM-005
+      name: "Shipment Severely Overdue"
+      trigger_topic: scvri.visibility.lead_time_deviation_events
+      conditions:
+        - field: eta_deviation_hours
+          operator: gte
+          value: 72       # 3+ days late
+      severity: high
+      delivery_channels: [in_app, email]
+
+    - rule_id: SYSTEM-006
+      name: "New Critical Risk Event from Intelligence Feed"
+      trigger_topic: scvri.risk.intelligence_events
+      conditions:
+        - field: severity
+          operator: in
+          value: [critical, high]
+        - field: matched_supplier_ids
+          operator: contains
+          value: "{{tenant_suppliers}}"    # dynamic: any tenant supplier matched
+      severity: critical
+      delivery_channels: [in_app, email, slack, sms]
+      ai_mitigation: true
+
+# =============================================================================
+# 4. DEDUPLICATION LOGIC (ALERT-FR-006)
+# =============================================================================
+deduplication:
+  strategy: time_window_bucketing
+
+  dedup_key_construction:
+    formula: "SHA-256(rule_id + entity_id + floor(detected_at / dedup_window_minutes))"
+    # Example: same rule + same supplier + within 60-min window → same dedup_key → SKIP
+
+  redis_check:
+    command: "SET dedup:{dedup_key} 1 NX PX {dedup_window_ms}"
+    result:
+      - OK: new alert (first in window) → proceed
+      - nil: duplicate within window → suppress
+
+  exceptions:
+    - severity: critical  → dedup_window = 30 min (shorter window for critical)
+    - severity: high      → dedup_window = 60 min
+    - severity: medium    → dedup_window = 120 min
+    - severity: low       → dedup_window = 360 min
+
+  suppression_log:
+    description: All suppressed alerts are logged (suppressed count on parent alert)
+    storage: alert.alerts.suppressed_count incremented
+
+# =============================================================================
+# 5. AI-RECOMMENDED MITIGATION ACTIONS (ALERT-FR-007)
+# =============================================================================
+mitigation_action_generator:
+  triggers:
+    - severity: critical
+    - severity: high
+
+  action_templates:
+    financial_risk_critical:
+      actions:
+        - type: source_diversification
+          description: "Identify and qualify alternate suppliers in lower-risk geographies"
+          alternate_suppliers: "{{risk_engine.get_alternates(supplier_id)}}"
+        - type: buffer_stock
+          description: "Increase safety stock for {{affected_categories}} to {{buffer_weeks}} weeks of supply"
+          buffer_weeks: 8  # calculated from lead_time_variance
+        - type: contractual_review
+          description: "Review force majeure clauses in supplier contract"
+
+    natural_disaster_high:
+      actions:
+        - type: expedite_existing_pos
+          description: "Accelerate receipt of open POs from affected supplier"
+        - type: alternate_sourcing
+          description: "Issue emergency RFQ to pre-qualified alternate suppliers"
+        - type: logistics_reroute
+          description: "Evaluate air freight for critical components in transit"
+
+    geopolitical_critical:
+      actions:
+        - type: sanctions_check
+          description: "Confirm no OFAC/EU sanctions violations on supplier entity"
+        - type: import_permit_review
+          description: "Review import permits and tariff classification impacted by {{event}}"
+        - type: dual_sourcing
+          description: "Initiate dual-sourcing strategy for {{commodity_code}}"
+
+    port_congestion_high:
+      actions:
+        - type: port_reroute
+          description: "Evaluate {{alternate_ports}} as alternatives to {{affected_port}}"
+        - type: mode_shift
+          description: "Evaluate air freight for highest-criticality shipments"
+        - type: expedite_customs
+          description: "Engage customs broker for priority clearance"
+
+# =============================================================================
+# 6. ESCALATION STATE MACHINE
+# =============================================================================
+escalation_state_machine:
+  states:
+    - open           # Generated, not yet acknowledged
+    - acknowledged   # User has acknowledged
+    - assigned       # Assigned to team member
+    - escalated_l1   # Not acknowledged within first escalation SLA
+    - escalated_l2   # Not acknowledged within second escalation SLA
+    - resolved       # Resolution notes added, closed
+    - suppressed     # Deduplication suppressed
+
+  transitions:
+    - from: open
+      to: acknowledged
+      trigger: user action (POST /alerts/{id}/acknowledge)
+
+    - from: open
+      to: escalated_l1
+      trigger: timer > escalation_config.delay_minutes
+      action: notify escalation_config.escalate_to_role
+
+    - from: escalated_l1
+      to: escalated_l2
+      trigger: timer > escalation_config.then_delay_minutes
+      action: notify escalation_config.then_to_role
+
+    - from: [escalated_l1, escalated_l2]
+      to: acknowledged
+      trigger: user action
+
+    - from: acknowledged
+      to: assigned
+      trigger: user action (POST /alerts/{id}/assign)
+
+    - from: [acknowledged, assigned, escalated_l1, escalated_l2]
+      to: resolved
+      trigger: user action (POST /alerts/{id}/resolve WITH resolution_notes)
+
+  escalation_timer_implementation:
+    technology: Celery Beat + Redis TTL
+    mechanism: >
+      On alert creation: schedule Celery task "check_escalation_{alert_id}"
+      with eta = generated_at + escalation_delay_minutes.
+      Task checks if status still 'open'; if yes → transition + notify + reschedule L2.
+    persistence: Celery tasks persisted in Redis (survive pod restart)
+
+# =============================================================================
+# 7. NOTIFICATION PROVIDER CONFIGURATION (Multi-channel)
+# ALERT-FR-003
+# =============================================================================
+notification_channels:
+  email:
+    provider_primary: AWS SES
+    provider_fallback: SendGrid
+    fallback_trigger: primary_failure_count >= 3
+    features:
+      - HTML template per alert severity (red/orange/yellow border)
+      - Unsubscribe link (GDPR compliance)
+      - SPF/DKIM/DMARC configured on sending domain
+    retry: 3 attempts, exponential backoff (1s, 5s, 30s)
+    dlq: scvri.dlq.notification_failures
+
+  sms:
+    provider_primary: Twilio
+    provider_fallback: AWS SNS SMS
+    condition: critical_severity ONLY
+    rate_limit: max 10 SMS/user/day (over-limit → email fallback)
+    opt_out: STOP keyword handling (TWILIO managed, CCPA compliant)
+
+  slack:
+    provider: Slack Bolt API
+    token_storage: AWS Secrets Manager (per tenant Slack workspace token)
+    message_format: Block Kit (rich alert card with buttons: Acknowledge, Assign, View Details)
+    fallback: email if Slack delivery fails
+
+  microsoft_teams:
+    provider: Teams Incoming Webhook / Bot Framework
+    message_format: Adaptive Card
+    token_storage: AWS Secrets Manager
+    fallback: email if Teams delivery fails
+
+  webhook:
+    description: Customer-configured HTTP endpoint (INT-FR-003)
+    retry: 5 attempts (1min, 5min, 15min, 1hr, 24hr exponential)
+    signature: HMAC-SHA256 of payload with customer-configured secret
+    timeout: 10s per attempt
+    dlq: scvri.dlq.webhook_failures
+
+  in_app:
+    delivery: WebSocket push to connected clients (Socket.IO server)
+    persistence: Stored in alert.alerts table regardless of WebSocket delivery
+    undelivered_handling: Users see alerts on next login from DB
+
+# =============================================================================
+# 8. REST API SPECIFICATION
+# =============================================================================
+api:
+  base_path: /api/v1/alerts
+  auth: bearer_jwt + tenant_context
+  rate_limit: 2000 req/min per tenant
+
+  endpoints:
+
+    - method: GET
+      path: /
+      description: Alert inbox (ALERT-FR-005)
+      query_params:
+        - name: status
+          type: array[string]
+          enum: [open, acknowledged, assigned, resolved, suppressed]
+        - name: severity
+          type: array[string]
+        - name: entity_type
+          type: string
+        - name: entity_id
+          type: uuid
+        - name: assigned_to
+          type: uuid
+        - name: from_time
+          type: string
+          format: date-time
+        - name: page
+          type: integer
+          default: 1
+        - name: page_size
+          type: integer
+          default: 50
+      response:
+        type: object
+        properties:
+          items: {type: array, items: {$ref: AlertSummary}}
+          total: {type: integer}
+          unread_count: {type: integer}
+          critical_count: {type: integer}
+
+    - method: POST
+      path: /{alert_id}/acknowledge
+      response:
+        type: object
+        properties:
+          alert_id: {type: string, format: uuid}
+          status: {type: string}
+          acknowledged_at: {type: string, format: date-time}
+      audit: true
+      action: "alert.acknowledge"
+
+    - method: POST
+      path: /{alert_id}/assign
+      request_body:
+        type: object
+        properties:
+          assigned_to: {type: string, format: uuid, required: true}
+          note: {type: string}
+      audit: true
+      action: "alert.assign"
+
+    - method: POST
+      path: /{alert_id}/resolve
+      request_body:
+        type: object
+        properties:
+          resolution_notes: {type: string, minLength: 10, required: true}
+      audit: true
+      action: "alert.resolve"
+
+    - method: GET
+      path: /rules
+      description: List all alert rules for tenant
+      response:
+        type: array
+        items: {$ref: AlertRule}
+
+    - method: POST
+      path: /rules
+      description: Create new alert rule (no-code builder) (ALERT-FR-002)
+      request_body:
+        $ref: AlertRuleCreateRequest
+      required_role: supply_chain_manager || it_administrator
+      audit: true
+
+    - method: PUT
+      path: /rules/{rule_id}
+      request_body:
+        $ref: AlertRuleUpdateRequest
+      required_role: supply_chain_manager || it_administrator
+      audit: true
+
+    - method: DELETE
+      path: /rules/{rule_id}
+      description: Deactivate rule (soft delete)
+      required_role: supply_chain_manager || it_administrator
+      audit: true
+
+    - method: GET
+      path: /audit-log
+      description: Full alert audit log (ALERT-FR-008)
+      query_params:
+        - name: alert_id
+          type: uuid
+        - name: from_time
+          type: string
+          format: date-time
+        - name: to_time
+          type: string
+          format: date-time
+      response:
+        type: array
+        items:
+          type: object
+          properties:
+            log_id: {type: string, format: uuid}
+            alert_id: {type: string, format: uuid}
+            action: {type: string}
+            performed_by: {type: string, format: uuid}
+            delivery_channel: {type: string, nullable: true}
+            delivery_status: {type: string, nullable: true}
+            occurred_at: {type: string, format: date-time}
+
+# =============================================================================
+# 9. SCALING MODEL
+# =============================================================================
+scaling:
+  rule_evaluator:
+    min_replicas: 3
+    max_replicas: 16
+    scale_metric: kafka_consumer_lag
+    scale_threshold: 2000
+    resource_requests: {cpu: "1000m", memory: "2Gi"}
+    resource_limits: {cpu: "4000m", memory: "8Gi"}
+
+  notification_workers:
+    min_replicas: 4
+    max_replicas: 20
+    scale_metric: kafka_consumer_lag (scvri.alerts.generated lag threshold: 50)
+    resource_requests: {cpu: "500m", memory: "1Gi"}
+    resource_limits: {cpu: "2000m", memory: "4Gi"}
+    priority_queues:
+      - critical_alerts  (dedicated 4-pod pool, highest priority)
+      - high_alerts      (shared pool)
+      - medium_low_alerts (shared pool)
+
+  escalation_manager:
+    replicas: 2                     # HA pair (one active, one standby)
+    leader_election: Redis SETNX
+    resource_requests: {cpu: "500m", memory: "1Gi"}
+
+# =============================================================================
+# 10. FAILURE MODES + RECOVERY
+# =============================================================================
+failure_modes:
+
+  - scenario: Primary email provider (AWS SES) down
+    detection: 3 consecutive delivery failures
+    recovery:
+      - Automatic failover to SendGrid within 10s
+      - Pending delivery tasks rerouted to fallback provider
+      - Alert undelivered count tracked per alert
+      - SLA: critical alert delivery attempted within 60s of primary failure detection
+
+  - scenario: Slack API rate limit exceeded
+    detection: HTTP 429 response from Slack API
+    recovery:
+      - Respect Retry-After header (typically 60s)
+      - Queue alerts in Redis; batch send after rate limit window
+      - Critical alerts: immediate fallback to email/SMS
+      - Non-critical: queued, delivered in next window
+
+  - scenario: Alert engine pod crash during rule evaluation
+    detection: Kubernetes pod restart; Kafka offset not committed
+    recovery:
+      - Kafka at-least-once: events replayed from last committed offset
+      - Dedup logic prevents duplicate alerts from replayed events
+      - Escalation timers: reconstructed from alert.alerts DB on startup
+
+  - scenario: Notification delivery completely fails (all channels)
+    detection: All delivery attempts exhausted; scvri.dlq.notification_failures populated
+    recovery:
+      - DLQ consumer retries after 15 min (max 3 more attempts)
+      - After total failure: in-app notification always survives (DB-backed)
+      - Ops alert: P1 incident if > 5 critical alerts in DLQ within 1 hour
+
+# =============================================================================
+# 11. OBSERVABILITY
+# =============================================================================
+observability:
+  metrics:
+    - name: alerts_generated_total
+      type: counter
+      labels: [tenant_id, severity, rule_type]
+    - name: alert_delivery_latency_seconds
+      type: histogram
+      labels: [channel, severity]
+      slo_target_p99: 300s          # NFR-PERF-005: < 5 min
+      alert_if_p99_exceeds: 240s    # warn at 4 min to catch violations early
+    - name: alert_delivery_failure_rate
+      type: gauge
+      labels: [channel]
+    - name: alerts_in_dlq_total
+      type: gauge
+      labels: [dlq_topic]
+      alert_threshold_p1: 5         # 5 critical undelivered
+    - name: escalation_events_total
+      type: counter
+      labels: [tenant_id, severity, escalation_level]
+    - name: alert_dedup_rate
+      type: gauge
+      labels: [tenant_id]
+      description: Proportion of events suppressed by deduplication
+
+# =============================================================================
+# 12. SRS TRACEABILITY
+# =============================================================================
+srs_traceability:
+  ALERT-FR-001: SYSTEM-001 rule (delta >= 10, 24h window) in rule_evaluation
+  ALERT-FR-002: POST /rules (no-code rule builder with condition operators)
+  ALERT-FR-003: All 6 channels: email(SES+SendGrid), SMS(Twilio), Slack, Teams, webhook, in_app
+  ALERT-FR-004: severity_mapping + escalation_config per rule
+  ALERT-FR-005: GET + POST /{id}/acknowledge + /{id}/assign + /{id}/resolve
+  ALERT-FR-006: deduplication time_window_bucketing with Redis NX
+  ALERT-FR-007: mitigation_action_generator (6 action_templates, critical+high severity)
+  ALERT-FR-008: GET /audit-log + audit.audit_log integration for all alert actions
+  NFR-PERF-005: sla_budget proves < 47s P50, < 3 min worst-case (within 5 min SLA)
+  NFR-AVAIL-002: notification subsystem 99.95% — dual-provider fallback + HA escalation manager
+
+# =============================================================================
+# 13. GAP DETECTION & FIXES
+# =============================================================================
+gaps_detected:
+  - gap: Escalation timer survives pod restart — Celery Beat with Redis persistence
+    fix: Celery Beat uses Redis as broker (not in-memory). All scheduled tasks survive pod
+         restarts. On service startup: scan alert.alerts WHERE status='open' AND
+         generated_at + escalation_minutes < now() → re-emit escalation for missed timers.
+
+  - gap: Alert storms during mass data feed ingestion (thousands of supplier scores updated)
+    fix: Rate limiter at rule evaluation level: max 50 new alerts/tenant/minute (configurable).
+         Excess events buffered in Redis sorted set by priority; consumed at controlled rate.
+         Critical severity exempt from rate limiting.
+
+  - gap: Webhook signature verification for customers
+    fix: Each webhook rule stores customer_secret (256-bit random, stored in Secrets Manager).
+         Every webhook POST includes header X-SCVRI-Signature: hmac-sha256={hex_digest}.
+         SDK documentation provided for verification. Customers can rotate secret via API.

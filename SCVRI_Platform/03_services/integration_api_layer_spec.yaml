@@ -1,0 +1,442 @@
+##############################################################################
+# MODULE 7 — INTEGRATION & API LAYER SPECIFICATION
+# SRS Coverage: INT-FR-001..008
+# Version: 1.0.0
+##############################################################################
+
+integration_layer:
+  name: integration-api-service
+  language: Python 3.12
+  framework: FastAPI 0.111
+  port: 8006
+  k8s_namespace: scvri-prod
+
+# ------------------------------------------------------------------------------
+# 1. RESPONSIBILITIES
+# ------------------------------------------------------------------------------
+responsibilities:
+  - Pre-built ERP connectors: SAP S/4HANA, Oracle Fusion, Microsoft Dynamics 365 (INT-FR-001)
+  - Procurement system connectors: SAP Ariba, Coupa, Jaggaer (INT-FR-003)
+  - ETL orchestration framework: Apache Airflow + dbt (INT-FR-002)
+  - EDI processing: ANSI X12 850/856/810, EDIFACT ORDERS/DESADV/INVOIC (INT-FR-004)
+  - Custom webhook delivery service with retry, HMAC signing, DLQ (INT-FR-005)
+  - Kong API Gateway configuration: routing, auth, rate limiting, transforms (INT-FR-006)
+  - External data feed broker: routes 15 risk feeds to Risk Intelligence Engine
+  - Two-way ERP write-back: goods receipts, payment terms, RFQ responses
+
+# ------------------------------------------------------------------------------
+# 2. ERP CONNECTORS
+# ------------------------------------------------------------------------------
+erp_connectors:
+  sap_s4hana:
+    type: bidirectional
+    protocol: OData v4 (primary) + RFC/BAPI fallback
+    auth:
+      type: OAuth 2.0 Client Credentials
+      token_endpoint: "https://{tenant}.authentication.eu10.hana.ondemand.com/oauth/token"
+      credential_store: AWS Secrets Manager
+    data_flows:
+      inbound_from_sap:
+        - entity: Purchase Orders → supply.purchase_orders
+          odata_entity: API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrder
+          polling: every_5_minutes
+          delta_token: true   # SAP delta query token for incremental sync
+        - entity: Suppliers → supply.suppliers
+          odata_entity: API_BUSINESS_PARTNER/A_BusinessPartner
+          filter: BusinessPartnerGrouping eq 'FLVN01'
+          polling: every_15_minutes
+        - entity: Goods Receipts → inventory_snapshots update
+          odata_entity: API_MATERIAL_DOCUMENT_SRV/A_MaterialDocHdr
+          polling: every_10_minutes
+        - entity: Invoices → scorecard invoice_accuracy computation
+          odata_entity: API_SUPPLIERINVOICE_PROCESS_SRV/A_SupplierInvoiceHeader
+          polling: every_30_minutes
+      outbound_to_sap:
+        - entity: Risk alerts → SAP notification
+          endpoint: POST /API_PURCHASEORDER_PROCESS_SRV/A_PurchaseOrderNote
+          trigger: risk_score >= 80 on po-linked supplier
+          queue: kafka_topic(integration.erp_write_queue.v1)
+          exactly_once: true   # Kafka idempotent + outbox pattern
+    field_mapping:
+      po_id: PurchaseOrder
+      po_number: PurchaseOrderNumber
+      supplier_id: map via BusinessPartner → supply.suppliers.sap_vendor_id
+      po_status: map ProcessingStatus → SCVRI PO state machine
+      currency: DocumentCurrency
+
+    error_handling:
+      circuit_breaker:
+        failure_threshold: 5
+        window_seconds: 60
+        half_open_test_interval: 30
+      retry:
+        strategy: exponential_backoff
+        max_attempts: 5
+        base_delay_seconds: 30
+        max_delay_seconds: 600
+      on_failure:
+        - Route to DLQ: ingestion.dlq
+        - Emit DataFeedFailure alert if circuit open > 15min
+      stale_data_indicator: Set last_sync_timestamp + display stale badge in UI
+
+  oracle_fusion:
+    type: bidirectional
+    protocol: Oracle SOAP + REST API
+    auth:
+      type: Basic Auth over HTTPS (Oracle Fusion Cloud)
+      credential_store: AWS Secrets Manager
+    data_flows:
+      inbound_from_oracle:
+        - entity: Purchase Orders
+          endpoint: /fscmRestApi/resources/latest/purchaseOrders
+          polling: every_5_minutes
+        - entity: Suppliers
+          endpoint: /fscmRestApi/resources/latest/suppliers
+          polling: every_15_minutes
+        - entity: Invoices
+          endpoint: /fscmRestApi/resources/latest/supplierInvoices
+          polling: every_30_minutes
+    field_mapping_note: Oracle uses PoNumber, Supplier, InvoiceAmount — mapped to SCVRI canonical schema
+
+  microsoft_dynamics_365:
+    type: bidirectional
+    protocol: Dataverse API (OData + REST)
+    auth:
+      type: OAuth 2.0 (Azure AD app registration)
+      scopes: ["https://org.crm.dynamics.com/.default"]
+    data_flows:
+      inbound:
+        - entity: Purchase Orders → supply.purchase_orders
+          odata: /api/data/v9.2/purchaseorders
+        - entity: Contacts/Suppliers → supply.suppliers
+          odata: /api/data/v9.2/accounts?$filter=accountcategorycode eq 2
+    note: "Dynamics 365 F&O connector configured via Power Automate for ERP write-back"
+
+  procurement_connectors:
+    sap_ariba:
+      protocol: Ariba Network APIs + S2C APIs
+      auth: OAuth 2.0 (Ariba Application Key)
+      inbound:
+        - RFx events → corrective_action_requests
+        - Contract updates → supplier.contract_status
+      outbound:
+        - Supplier risk scores → Ariba Risk dashboard
+        - Alert notifications → Ariba Inbox
+
+    coupa:
+      protocol: Coupa REST API v2
+      auth: OAuth 2.0
+      inbound:
+        - Purchase Requisitions → supply.purchase_orders
+        - Supplier profiles → supply.suppliers sync
+      outbound:
+        - Risk score updates → Coupa Supplier Risk module
+
+# ------------------------------------------------------------------------------
+# 3. EDI PROCESSING (INT-FR-004)
+# ------------------------------------------------------------------------------
+edi_processing:
+  supported_standards:
+    - ANSI_X12:
+        versions: [4010, 5010]
+        transactions:
+          - 850: Purchase Order → map to supply.purchase_orders INSERT
+          - 856: Advance Ship Notice → map to supply.shipments INSERT/UPDATE
+          - 810: Invoice → scorecard invoice_accuracy input
+          - 855: PO Acknowledgment → po.status = acknowledged
+    - EDIFACT:
+        versions: [D96A, D01B]
+        messages:
+          - ORDERS: Purchase Order
+          - DESADV: Despatch Advice → shipment update
+          - INVOIC: Invoice
+          - ORDRSP: Order Response
+
+  processing_pipeline:
+    step_1_receive:
+      channels: [AS2, SFTP, HTTPS POST, AWS Transfer Family]
+      storage: s3://scvri-edi-inbound-{tenant_id}/
+
+    step_2_parse:
+      library: python-stdnum + pydifact (EDIFACT) + x12 (X12)
+      output: canonical JSON event
+      on_parse_error:
+        - Store raw file in s3://scvri-edi-errors/
+        - Emit DataIngestionFailedEvent
+        - Alert procurement_officer (medium severity)
+
+    step_3_validate:
+      checks:
+        - mandatory segments present (ISA, GS, GE, IEA for X12)
+        - partner ID maps to known supplier in supply.suppliers
+        - transaction date within 30-day window
+      on_validation_failure:
+        - Reject with 997 Functional Acknowledgment (error 001..999)
+
+    step_4_transform:
+      mapping: EDI segment → SCVRI canonical schema (maps defined in integration_mappings.json)
+
+    step_5_publish:
+      destination: Kafka topic ingestion.erp_events.v1
+      key: tenant_id
+      include_raw_edi_s3_ref: true
+
+    step_6_acknowledge:
+      X12: Send 997 FA on success/failure
+      EDIFACT: Send CONTRL message
+      AS2: MDN (Message Disposition Notification)
+
+# ------------------------------------------------------------------------------
+# 4. ETL ORCHESTRATION (INT-FR-002)
+# ------------------------------------------------------------------------------
+etl_orchestration:
+  platform: Apache Airflow 2.9 (Amazon MWAA managed)
+  environment: scvri-prod-airflow
+
+  dags:
+    - dag_id: erp_supplier_sync
+      schedule: "*/15 * * * *"   # every 15 minutes
+      tasks:
+        - extract_sap_suppliers
+        - extract_oracle_suppliers
+        - extract_dynamics_suppliers
+        - deduplicate_and_merge    # pg_trgm resolution
+        - load_to_supply_suppliers
+        - invalidate_supplier_cache
+        - emit_supplier_lifecycle_events
+
+    - dag_id: erp_po_sync
+      schedule: "*/5 * * * *"
+      tasks:
+        - extract_sap_pos
+        - extract_oracle_pos
+        - map_to_scvri_schema
+        - upsert_purchase_orders
+        - update_po_state_machine
+
+    - dag_id: daily_scorecard_computation
+      schedule: "0 2 * * *"   # 2 AM UTC
+      tasks:
+        - fetch_period_shipments
+        - fetch_period_po_lines
+        - compute_otd_rate
+        - compute_defect_rate
+        - compute_fill_rate
+        - compute_invoice_accuracy
+        - compute_weighted_score
+        - upsert_supplier_scorecards
+        - emit_scorecard_events
+        - update_clickhouse_kri_snapshots
+
+    - dag_id: external_risk_feed_ingest
+      schedule: "0 * * * *"   # hourly
+      tasks:
+        - ingest_duns_credit_data
+        - ingest_refinitiv_esg
+        - ingest_refinitiv_news
+        - ingest_weather_data
+        - ingest_port_congestion
+        - ingest_geopolitical_feed
+        - ingest_sanctions_ofac
+        - ingest_sanctions_eu
+        - ingest_vessel_tracking
+        - deduplicate_intelligence
+        - load_to_risk_external_intelligence
+        - emit_risk_intelligence_events
+
+  dbt_models:
+    project: scvri_dbt
+    warehouse: ClickHouse
+    models:
+      - name: mart_supplier_risk_summary
+        materialization: incremental
+        schedule: hourly
+      - name: mart_spend_by_category
+        materialization: incremental
+        schedule: daily
+      - name: mart_supply_chain_exposure
+        materialization: table
+        schedule: daily
+      - name: mart_kri_time_series
+        materialization: incremental
+        schedule: hourly
+
+# ------------------------------------------------------------------------------
+# 5. WEBHOOK DELIVERY SERVICE (INT-FR-005)
+# ------------------------------------------------------------------------------
+webhook_delivery:
+  description: "Outbound webhook delivery for subscribed events with HMAC signing"
+
+  event_types:
+    - risk_score.critical        # composite >= 80
+    - risk_score.delta_10        # +/- 10 point change
+    - shipment.status_changed
+    - alert.critical_generated
+    - supplier.status_changed
+    - supplier.onboarding_completed
+    - po.status_changed
+    - document.expiring_30d
+
+  delivery_mechanism:
+    queue: Kafka topic integration.webhook_delivery.v1
+    consumer_group: webhook-delivery-workers
+    worker_concurrency: 8
+
+  signature:
+    algorithm: HMAC-SHA256
+    header: X-SCVRI-Signature
+    format: "sha256={hex_digest}"
+    secret_storage: AWS Secrets Manager /tenants/{tenant_id}/webhooks/{webhook_id}
+    payload_signed: raw JSON body
+
+  retry_policy:
+    max_attempts: 5
+    backoff:
+      - attempt_1: immediate
+      - attempt_2: 30s
+      - attempt_3: 5min
+      - attempt_4: 30min
+      - attempt_5: 2hr
+    on_final_failure:
+      - Route to DLQ: notification.dlq
+      - Email tenant admin if critical event failed all retries
+      - Set webhook.consecutive_failures += 1; auto-disable at 20
+
+  success_criteria:
+    - HTTP 2xx response within 30s
+    - Idempotency: event_id in payload; receiver must deduplicate
+
+  payload_format:
+    headers:
+      X-SCVRI-Event: "{event_type}"
+      X-SCVRI-Delivery-ID: "{delivery_uuid}"
+      X-SCVRI-Signature: "sha256={hex}"
+      Content-Type: "application/json"
+    body:
+      event_type: string
+      event_id: uuid
+      tenant_id: uuid
+      occurred_at: datetime
+      data: object   # event-specific payload
+
+# ------------------------------------------------------------------------------
+# 6. KONG API GATEWAY CONFIGURATION (INT-FR-006)
+# ------------------------------------------------------------------------------
+kong_gateway:
+  version: "3.6 (EKS-deployed)"
+  admin_api: internal (not exposed externally)
+  plugins_enabled:
+    - jwt          # RS256 JWT validation, tenant_id in sub claim
+    - rate-limiting
+    - response-transformer
+    - correlation-id
+    - prometheus
+    - request-termination
+    - ip-restriction
+    - bot-detection
+    - openid-connect   # SSO OIDC proxy
+    - oauth2
+
+  routes:
+    - name: supplier-management-api
+      hosts: [api.scvri.io]
+      paths: [/api/v1/suppliers]
+      service: supplier-management-service:8005
+      plugins:
+        jwt:
+          key_set_url: "https://auth.scvri.io/.well-known/jwks.json"
+        rate-limiting:
+          minute: 1000
+          policy: redis
+          redis_host: scvri-redis-prod
+        correlation-id:
+          header_name: X-Request-ID
+          generator: uuid
+
+    - name: risk-api
+      hosts: [api.scvri.io]
+      paths: [/api/v1/risk]
+      service: risk-intelligence-service:8003
+      plugins:
+        rate-limiting:
+          minute: 500
+
+    - name: visibility-api
+      hosts: [api.scvri.io]
+      paths: [/api/v1/visibility]
+      service: visibility-service:8002
+      plugins:
+        rate-limiting:
+          minute: 2000
+
+    - name: analytics-api
+      hosts: [api.scvri.io]
+      paths: [/api/v1/reports]
+      service: analytics-service:8007
+      plugins:
+        rate-limiting:
+          hour: 100     # report generation is expensive
+
+    - name: admin-api
+      hosts: [api.scvri.io]
+      paths: [/api/v1/admin]
+      service: iam-service:8001
+      plugins:
+        ip-restriction:
+          allow: []    # populated per tenant with admin IP set
+
+  rate_limit_tiers:
+    starter_plan: {minute: 500, hour: 10000, day: 100000}
+    professional_plan: {minute: 2000, hour: 50000, day: 500000}
+    enterprise_plan: {minute: 10000, hour: 200000, day: 2000000}
+
+  health_checks:
+    active:
+      http_path: /ready
+      interval: 10s
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+
+# ------------------------------------------------------------------------------
+# 7. SRS TRACEABILITY
+# ------------------------------------------------------------------------------
+srs_traceability:
+  - srs_id: INT-FR-001
+    description: "Pre-built ERP connectors (SAP, Oracle, Dynamics)"
+    implemented_by: "erp_connectors.sap_s4hana, oracle_fusion, microsoft_dynamics_365"
+
+  - srs_id: INT-FR-002
+    description: "ETL orchestration framework"
+    implemented_by: "Apache Airflow MWAA + dbt models"
+
+  - srs_id: INT-FR-003
+    description: "Procurement system connectors (Ariba, Coupa)"
+    implemented_by: "procurement_connectors.sap_ariba, coupa"
+
+  - srs_id: INT-FR-004
+    description: "EDI processing (X12, EDIFACT)"
+    implemented_by: "edi_processing 6-step pipeline"
+
+  - srs_id: INT-FR-005
+    description: "Webhook delivery service"
+    implemented_by: "webhook_delivery service with HMAC-SHA256 + 5-attempt retry"
+
+  - srs_id: INT-FR-006
+    description: "API Gateway"
+    implemented_by: "Kong Gateway 3.6 with JWT + rate limiting + correlation IDs"
+
+# ------------------------------------------------------------------------------
+# 8. GAPS DETECTED & FIXES APPLIED
+# ------------------------------------------------------------------------------
+gaps_and_fixes:
+  - gap_id: INT-GAP-001
+    description: "SRS does not specify EDI acknowledgment standards."
+    fix: "Implemented X12 997 Functional Acknowledgment and EDIFACT CONTRL message for all inbound EDI. AS2 MDN for AS2 channel."
+
+  - gap_id: INT-GAP-002
+    description: "SRS does not specify how ERP write-back avoids duplicate entries on retry."
+    fix: "Implemented outbox pattern with exactly-once semantics on Kafka integration.erp_write_queue.v1. ERP adapters use idempotency keys: SCVRI-{event_id}. SAP BAPIs called with COMMIT_AND_WAIT."
+
+  - gap_id: INT-GAP-003
+    description: "ERP polling vs event-driven: polling adds latency."
+    fix: "SAP S/4HANA configured to push Business Event Handling (BEH) events to SCVRI via HTTPS webhook for real-time PO status changes. Polling is fallback for tenants without HTTPS Destination configured."
