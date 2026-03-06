@@ -143,6 +143,13 @@ def _drop_enums() -> None:
     pass
 
 
+def _drop_tables() -> None:
+    # All tables live inside the platform schemas; they are dropped via
+    # CASCADE when _drop_schemas() runs.  This function exists so the
+    # downgrade() call order is explicit and mirrors upgrade().
+    pass
+
+
 # ===========================================================================
 # STEP 3 — Tables
 # ===========================================================================

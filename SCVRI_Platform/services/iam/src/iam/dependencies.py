@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncGenerator
 from typing import Annotated
 
 import redis.asyncio as aioredis
@@ -39,7 +40,7 @@ async def get_redis() -> aioredis.Redis:
 
 # ── DB session ────────────────────────────────────────────────────────────────
 
-async def get_db(tenant_id: uuid.UUID) -> AsyncSession:
+async def get_db(tenant_id: uuid.UUID) -> AsyncGenerator[AsyncSession, None]:  # type: ignore[return]
     async with get_tenant_session(tenant_id) as session:
         yield session
 
@@ -90,7 +91,7 @@ async def get_current_user(
 
 async def get_tenant_db_from_token(
     claims: Annotated[TokenClaims, Depends(get_current_user)],
-) -> AsyncSession:
+) -> AsyncGenerator[AsyncSession, None]:  # type: ignore[return]
     async with get_tenant_session(claims.tenant_id) as session:
         yield session
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,8 +13,11 @@ import httpx
 
 from tests.conftest import TENANT_ID
 
+if TYPE_CHECKING:
+    from integration.schemas.erp import ERPConnectionConfig
 
-def _make_config(system: str = "sap") -> "ERPConnectionConfig":
+
+def _make_config(system: str = "sap") -> ERPConnectionConfig:
     from integration.schemas.erp import ERPConnectionConfig, ERPSystem
 
     return ERPConnectionConfig(

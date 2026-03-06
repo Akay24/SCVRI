@@ -7,11 +7,18 @@ const SupplierSchema = z.object({
   riskScore: z.number(),
   spend: z.number(),
   activePOs: z.number(),
-  region: z.string()
+  region: z.string(),
+  tier: z.number(),
+  category: z.string(),
+  onTimeDelivery: z.number(),
+  qualityYield: z.number(),
+  inTransit: z.number(),
+  delayed: z.number(),
+  country: z.string(),
 });
 
 export type Supplier = z.infer<typeof SupplierSchema>;
 
 export const supplierService = {
-  list: async (): Promise<Supplier[]> => z.array(SupplierSchema).parse(suppliers)
+  list: async (): Promise<Supplier[]> => z.array(SupplierSchema).parse(suppliers),
 };

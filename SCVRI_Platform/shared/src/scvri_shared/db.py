@@ -158,3 +158,29 @@ def get_sync_engine() -> Any:
 
 def get_async_engine() -> Any:
     return _async_engine
+
+
+# ---------------------------------------------------------------------------
+# Convenience aliases — backwards-compat names used across services
+# ---------------------------------------------------------------------------
+
+# FastAPI dependency — yields an unscoped (public) async session
+get_public_session = get_async_session
+
+# Alias: tenant_session is itself the context-manager dep used as
+# ``async with get_tenant_session(tenant_id) as session``
+get_tenant_session = tenant_session
+
+# Alias: sync engine accessor
+get_engine = get_sync_engine
+
+# Alias: async session dep used directly in Annotated hints
+get_db = get_async_session
+get_async_db = get_async_session
+
+# Annotated convenience type for FastAPI route signatures
+from typing import Annotated  # noqa: E402
+from fastapi import Depends  # noqa: E402
+
+AsyncSessionDep = Annotated[AsyncSession, Depends(get_async_session)]
+

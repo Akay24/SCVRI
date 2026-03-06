@@ -7,7 +7,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from alert_engine.dependencies import get_tenant_db, require_admin, require_write_access
+from alert_engine.dependencies import (
+    TenantDB,
+    TenantID,
+    UserID,
+    get_tenant_db,
+    require_admin,
+    require_write_access,
+)
 from alert_engine.schemas.notification import (
     NotificationChannelCreate,
     NotificationChannelResponse,
@@ -15,13 +22,12 @@ from alert_engine.schemas.notification import (
     NotificationLogResponse,
 )
 from alert_engine.services import notification_service
-from scvri_shared.auth import TokenClaims
 
 router = APIRouter(tags=["notifications"])
 
-DbDep = Annotated[AsyncSession, Depends(get_tenant_db)]
-WriteDep = Annotated[TokenClaims, Depends(require_write_access)]
-AdminDep = Annotated[TokenClaims, Depends(require_admin)]
+DbDep = TenantDB
+WriteDep = Annotated[None, Depends(require_write_access)]
+AdminDep = Annotated[None, Depends(require_admin)]
 
 
 # ── Channels ───────────────────────────────────────────────────────────────────
@@ -29,9 +35,9 @@ AdminDep = Annotated[TokenClaims, Depends(require_admin)]
 @router.get("/channels", response_model=list[NotificationChannelResponse])
 async def list_channels(
     db: DbDep,
-    claims: Annotated[TokenClaims, Depends()],
+    tenant_id: TenantID,
 ) -> list[NotificationChannelResponse]:
-    return await notification_service.list_channels(db, claims.tenant_id)
+    return await notification_service.list_channels(db, tenant_id)
 
 
 @router.post(
@@ -42,11 +48,13 @@ async def list_channels(
 async def create_channel(
     data: NotificationChannelCreate,
     db: DbDep,
-    claims: AdminDep,
+    tenant_id: TenantID,
+    user_id: UserID,
+    _: AdminDep,
 ) -> NotificationChannelResponse:
     """Create a notification channel (admin only)."""
     return await notification_service.create_channel(
-        db, claims.tenant_id, claims.user_id, data
+        db, tenant_id, user_id, data
     )
 
 
@@ -54,9 +62,9 @@ async def create_channel(
 async def get_channel(
     channel_id: uuid.UUID,
     db: DbDep,
-    claims: Annotated[TokenClaims, Depends()],
+    tenant_id: TenantID,
 ) -> NotificationChannelResponse:
-    return await notification_service.get_channel(db, claims.tenant_id, channel_id)
+    return await notification_service.get_channel(db, tenant_id, channel_id)
 
 
 @router.patch("/channels/{channel_id}", response_model=NotificationChannelResponse)
@@ -64,11 +72,12 @@ async def update_channel(
     channel_id: uuid.UUID,
     data: NotificationChannelUpdate,
     db: DbDep,
-    claims: AdminDep,
+    tenant_id: TenantID,
+    _: AdminDep,
 ) -> NotificationChannelResponse:
     """Update channel config (admin only)."""
     return await notification_service.update_channel(
-        db, claims.tenant_id, channel_id, data
+        db, tenant_id, channel_id, data
     )
 
 
@@ -76,21 +85,21 @@ async def update_channel(
 async def delete_channel(
     channel_id: uuid.UUID,
     db: DbDep,
-    claims: AdminDep,
+    tenant_id: TenantID,
+    _: AdminDep,
 ) -> None:
     """Deactivate a channel (admin only)."""
-    await notification_service.delete_channel(db, claims.tenant_id, channel_id)
+    await notification_service.delete_channel(db, tenant_id, channel_id)
 
 
 @router.post("/channels/{channel_id}/test")
 async def test_channel(
     channel_id: uuid.UUID,
     db: DbDep,
-    claims: AdminDep,
+    tenant_id: TenantID,
+    _: AdminDep,
 ) -> dict[str, str]:
     """Send a test notification through this channel."""
-    from sqlalchemy import text  # noqa: PLC0415
-
     # Build a synthetic alert dict for testing
     fake_alert: dict = {
         "id": str(uuid.uuid4()),
@@ -103,7 +112,7 @@ async def test_channel(
         "created_at": __import__("datetime").datetime.utcnow(),
     }
 
-    channel = await notification_service.get_channel(db, claims.tenant_id, channel_id)
+    channel = await notification_service.get_channel(db, tenant_id, channel_id)
     cfg = channel.config if isinstance(channel.config, dict) else {}
 
     try:
@@ -129,9 +138,9 @@ async def test_channel(
 async def get_alert_notifications(
     alert_id: uuid.UUID,
     db: DbDep,
-    claims: Annotated[TokenClaims, Depends()],
+    tenant_id: TenantID,
 ) -> list[NotificationLogResponse]:
     """Delivery log for a specific alert."""
     return await notification_service.list_notification_logs(
-        db, claims.tenant_id, alert_id
+        db, tenant_id, alert_id
     )

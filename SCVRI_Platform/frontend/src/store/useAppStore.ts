@@ -6,7 +6,9 @@ type Notification = { id: string; title: string; severity: "critical" | "high" |
 type AppState = {
   role: Role;
   notifications: Notification[];
+  darkMode: boolean;
   setRole: (role: Role) => void;
+  toggleDarkMode: () => void;
 };
 
 export const useAppStore = create<AppState>((set) => ({
@@ -15,5 +17,7 @@ export const useAppStore = create<AppState>((set) => ({
     { id: "n1", title: "Port closure risk increased", severity: "high" },
     { id: "n2", title: "Supplier SLA breach", severity: "medium" }
   ],
-  setRole: (role) => set({ role })
+  darkMode: false,
+  setRole: (role) => set({ role }),
+  toggleDarkMode: () => set((s) => ({ darkMode: !s.darkMode })),
 }));

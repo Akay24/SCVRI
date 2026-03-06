@@ -2,10 +2,130 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ─── CSS Variables — light mode ─────────────────────────────────────────── */
 :root {
   color-scheme: light;
+
+  --bg-page:    #f0fafb;
+  --bg-card:    #ffffff;
+  --bg-sidebar: #003135;
+  --bg-topbar:  #ffffff;
+  --bg-surface: #e3f6f8;
+  --border:     #c4e4e8;
+  --text:       #012528;
+  --text-2:     #2d5f63;
+  --text-3:     #6b9497;
+  --accent:     #0FA4AF;
+  --accent-sub: rgba(15, 164, 175, 0.12);
+  --cta:        #964734;
+  --cta-hov:    #7a3929;
+
+  --nav-text:      #AFDDE5;
+  --nav-active-bg: rgba(15, 164, 175, 0.22);
+  --nav-hover-bg:  rgba(175, 221, 229, 0.1);
 }
 
-body {
-  @apply bg-slate-100 text-slate-900 antialiased;
+/* ─── CSS Variables — dark mode ──────────────────────────────────────────── */
+.dark {
+  color-scheme: dark;
+
+  --bg-page:    #011c1f;
+  --bg-card:    #012d30;
+  --bg-sidebar: #001a1c;
+  --bg-topbar:  #012d30;
+  --bg-surface: #024950;
+  --border:     #0d5a62;
+  --text:       #e8f5f7;
+  --text-2:     #AFDDE5;
+  --text-3:     #6b9a9e;
+  --accent:     #0FA4AF;
+  --accent-sub: rgba(15, 164, 175, 0.18);
+  --cta:        #964734;
+  --cta-hov:    #b05840;
+
+  --nav-text:      #AFDDE5;
+  --nav-active-bg: rgba(15, 164, 175, 0.28);
+  --nav-hover-bg:  rgba(175, 221, 229, 0.06);
 }
+
+/* ─── Base ───────────────────────────────────────────────────────────────── */
+body {
+  background-color: var(--bg-page);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ─── Dark-mode blanket overrides ────────────────────────────────────────── */
+/* Pages using hardcoded slate-* classes automatically adapt in dark mode     */
+.dark .bg-white         { background-color: var(--bg-card)    !important; }
+.dark .bg-slate-50      { background-color: var(--bg-surface) !important; }
+.dark .bg-slate-100     { background-color: var(--bg-surface) !important; }
+.dark .bg-slate-200     { background-color: var(--border)     !important; }
+.dark .border-slate-100 { border-color: var(--border) !important; }
+.dark .border-slate-200 { border-color: var(--border) !important; }
+.dark .border-slate-300 { border-color: var(--border) !important; }
+.dark .text-slate-900, .dark .text-slate-800 { color: var(--text)   !important; }
+.dark .text-slate-700, .dark .text-slate-600 { color: var(--text-2) !important; }
+.dark .text-slate-500, .dark .text-slate-400 { color: var(--text-3) !important; }
+.dark .divide-slate-100 > * + * { border-color: var(--border) !important; }
+.dark .divide-slate-200 > * + * { border-color: var(--border) !important; }
+
+/* ─── React-Grid-Layout polish ─────────────────────────────────────────────*/
+.react-grid-item {
+  transition: box-shadow 150ms ease, transform 200ms ease !important;
+  border-radius: 0.5rem;
+}
+
+.react-grid-item.react-draggable-dragging {
+  box-shadow: 0 20px 40px -8px rgba(0, 0, 0, 0.25), 0 8px 16px -4px rgba(0, 0, 0, 0.15);
+  z-index: 99;
+  opacity: 0.95;
+}
+
+.react-grid-item.react-grid-placeholder {
+  background: var(--accent-sub) !important;
+  border: 2px dashed var(--accent) !important;
+  border-radius: 0.5rem;
+  opacity: 0.8 !important;
+}
+
+.drag {
+  cursor: grab;
+  user-select: none;
+}
+.drag:active {
+  cursor: grabbing;
+}
+
+.react-resizable-handle {
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  bottom: 6px;
+  right: 6px;
+  cursor: se-resize;
+  opacity: 0;
+  transition: opacity 150ms ease;
+  background: none;
+}
+.react-resizable-handle::after {
+  content: "";
+  position: absolute;
+  bottom: 2px;
+  right: 2px;
+  width: 10px;
+  height: 10px;
+  border-right: 2px solid var(--border);
+  border-bottom: 2px solid var(--border);
+  border-radius: 0 0 2px 0;
+}
+.react-grid-item:hover .react-resizable-handle {
+  opacity: 1;
+}
+
+/* ─── Custom scrollbar ───────────────────────────────────────────────────── */
+::-webkit-scrollbar             { width: 6px; height: 6px; }
+::-webkit-scrollbar-track       { background: transparent; }
+::-webkit-scrollbar-thumb       { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }

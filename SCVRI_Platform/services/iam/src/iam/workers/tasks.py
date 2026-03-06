@@ -21,9 +21,9 @@ def purge_expired_sessions_task() -> dict:
     """
     async def _run() -> int:
         from sqlalchemy import text  # noqa: PLC0415
-        from scvri_shared.database import get_engine  # noqa: PLC0415
+        from scvri_shared.db import get_async_engine  # noqa: PLC0415
 
-        engine = get_engine()
+        engine = get_async_engine()
         async with engine.begin() as conn:
             result = await conn.execute(text("""
                 DELETE FROM iam.password_reset_tokens

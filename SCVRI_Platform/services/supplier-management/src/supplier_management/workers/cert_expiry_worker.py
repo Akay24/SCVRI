@@ -42,7 +42,7 @@ def check_cert_expiry() -> dict:
     """Scan all tenants for expiring/expired certifications and emit alert events."""
     from sqlalchemy import create_engine  # noqa: PLC0415
     from sqlalchemy.orm import Session  # noqa: PLC0415
-    from scvri_shared.models.platform import Tenant  # noqa: PLC0415
+    from scvri_shared.models.tenant import Tenant  # noqa: PLC0415
 
     log.info("cert_expiry.check.start")
 

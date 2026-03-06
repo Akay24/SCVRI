@@ -1,0 +1,31 @@
+{
+  "pythonVersion": "3.12",
+  "venvPath": "/Users/akayr/Downloads/BUSINESS PROJECTS",
+  "venv": ".venv",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "extraPaths": [
+    "shared/src",
+    "services/alert-engine/src",
+    "services/iam/src",
+    "services/integration/src",
+    "services/risk-intelligence/src",
+    "services/supplier-management/src",
+    "services/visibility/src"
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.venv",
+    "**/.mypy_cache",
+    "frontend"
+  ],
+  "include": [
+    "shared/src",
+    "shared/tests",
+    "shared/alembic",
+    "services",
+    "scripts"
+  ]
+}

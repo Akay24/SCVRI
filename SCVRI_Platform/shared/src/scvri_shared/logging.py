@@ -94,8 +94,8 @@ def configure_logging(
     """
     from scvri_shared.config import settings  # noqa: PLC0415 (avoid circular at module load)
 
-    effective_level = (level or settings.LOG_LEVEL).upper()
-    use_json = json_logs if json_logs is not None else settings.ENVIRONMENT != "development"
+    effective_level = (level or settings.log_level).upper()
+    use_json = json_logs if json_logs is not None else settings.environment != "development"
 
     # Configure stdlib root logger so third-party libs' log records flow through structlog
     logging.basicConfig(
@@ -146,6 +146,6 @@ def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     from scvri_shared.config import settings  # noqa: PLC0415
 
     return structlog.get_logger(name or "scvri").bind(
-        service=settings.SERVICE_NAME,
-        env=settings.ENVIRONMENT,
+        service=settings.service_name,
+        env=settings.environment,
     )

@@ -21,7 +21,7 @@ dependencies = [
     "pyotp==2.9.0",                        # TOTP MFA (RFC 6238)
     "qrcode[pil]==8.0",                    # QR code for TOTP provisioning URI
     "httpx==0.28.1",
-    "scvri-shared @ file:///${PROJECT_ROOT}/shared",
+    "scvri-shared @ {root:uri}/../../shared",
 ]
 
 [project.optional-dependencies]
@@ -34,12 +34,16 @@ dev = [
     "factory-boy==3.3.1",
 ]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/iam"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.coverage.run]
 source = ["src/iam"]

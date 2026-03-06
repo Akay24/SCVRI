@@ -61,7 +61,7 @@ class EventEnvelope:
     event_type: str
     tenant_id: str
     payload: dict[str, Any]
-    source_service: str = field(default_factory=lambda: settings.SERVICE_NAME)
+    source_service: str = field(default_factory=lambda: settings.service_name)
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     spec_version: str = "1.0"
     correlation_id: str = "-"

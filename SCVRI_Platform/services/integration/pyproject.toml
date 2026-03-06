@@ -21,7 +21,7 @@ dependencies = [
     "python-jose[cryptography]==3.3.0",
     "asyncpg==0.30.0",
     "sqlalchemy[asyncio]==2.0.36",
-    "scvri-shared @ file:///${PROJECT_ROOT}/shared",
+    "scvri-shared @ {root:uri}/../../shared",
 ]
 
 [project.optional-dependencies]
@@ -33,12 +33,16 @@ dev = [
     "respx==0.21.1",
 ]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/integration"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100
