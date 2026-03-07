@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "dev": "npm run --prefix frontend dev",
-    "build": "npm run --prefix frontend build",
+    "build": "npm install --prefix frontend && npm run --prefix frontend build",
     "start": "npm run --prefix frontend start",
     "lint": "npm run --prefix frontend lint",
     "typecheck": "npm run --prefix frontend typecheck",
