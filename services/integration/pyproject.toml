@@ -19,7 +19,7 @@ dependencies = [
     "celery[redis]==5.4.0",
     "cryptography==43.0.1",
     "python-jose[cryptography]==3.3.0",
-    "asyncpg==0.30.0",
+    "asyncpg==0.31.0",
     "sqlalchemy[asyncio]==2.0.36",
     "scvri-shared @ {root:uri}/../../shared",
 ]
