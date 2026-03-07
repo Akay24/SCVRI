@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 RUN pip install uv
 
@@ -11,7 +11,7 @@ WORKDIR /build/services/visibility
 RUN uv pip install --system --no-cache ".[dev]"
 
 # ── Runtime ───────────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 # Required by Shapely / GEOS
 RUN apt-get update && apt-get install -y --no-install-recommends \
