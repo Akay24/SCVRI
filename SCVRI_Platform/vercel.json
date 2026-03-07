@@ -1,6 +1,7 @@
 {
-  "buildCommand": "npm install --prefix frontend && npm run --prefix frontend build",
-  "outputDirectory": "frontend/.next",
-  "installCommand": "echo 'deps installed by buildCommand'",
-  "framework": "nextjs"
+  "rootDirectory": "frontend",
+  "framework": "nextjs",
+  "env": {
+    "IAM_URL": "https://scvri-iam.onrender.com"
+  }
 }
