@@ -1,0 +1,7 @@
+{
+  "rootDirectory": "frontend",
+  "framework": "nextjs",
+  "env": {
+    "IAM_URL": "https://scvri-iam.onrender.com"
+  }
+}
