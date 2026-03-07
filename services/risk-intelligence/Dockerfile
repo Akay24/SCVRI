@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────
 # Stage 1 — dependency builder
 # ─────────────────────────────────────────────
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 RUN pip install --no-cache-dir uv==0.5.14
 
@@ -19,7 +19,7 @@ RUN uv pip install --system --no-cache ./service/
 # ─────────────────────────────────────────────
 # Stage 2 — lean runtime
 # ─────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
