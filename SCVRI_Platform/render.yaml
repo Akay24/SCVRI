@@ -1,0 +1,80 @@
+# render.yaml — Render.com infrastructure definition
+# Docs: https://render.com/docs/yaml-spec
+#
+# Services deployed here:
+#   - iam-service     FastAPI identity & access management (port 8000)
+#
+# Managed infrastructure:
+#   - scvri-postgres  PostgreSQL 16
+#   - scvri-redis     Redis 7
+
+databases:
+  - name: scvri-postgres
+    databaseName: scvri
+    user: scvri_admin
+    plan: free           # upgrade to starter/standard for production
+    region: oregon
+    ipAllowList: []      # allow all — restrict to service IPs in production
+
+services:
+  # ── IAM Service ────────────────────────────────────────────────────────────
+  - type: web
+    name: scvri-iam
+    runtime: python
+    region: oregon
+    plan: free           # upgrade for production
+    rootDir: services/iam
+    buildCommand: pip install -e "../../shared" && pip install -e .
+    startCommand: uvicorn iam.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: SERVICE_NAME
+        value: scvri-iam
+      - key: LOG_LEVEL
+        value: INFO
+
+      # PostgreSQL — auto-filled from the database above
+      - key: DB_HOST
+        fromDatabase:
+          name: scvri-postgres
+          property: host
+      - key: DB_PORT
+        fromDatabase:
+          name: scvri-postgres
+          property: port
+      - key: DB_NAME
+        fromDatabase:
+          name: scvri-postgres
+          property: database
+      - key: DB_USER
+        fromDatabase:
+          name: scvri-postgres
+          property: user
+      - key: DB_PASSWORD
+        fromDatabase:
+          name: scvri-postgres
+          property: password
+
+      # Redis — set REDIS_HOST / REDIS_PASSWORD manually after creating the
+      # Redis instance below (Render free Redis doesn't support render.yaml ref)
+      - key: REDIS_HOST
+        value: localhost    # replace with your Render Redis internal hostname
+      - key: REDIS_PORT
+        value: 6379
+
+      # JWT RS256 keys — paste PEM content as secret env vars in Render dashboard
+      # Generate with: openssl genrsa -out private.pem 2048
+      #                openssl rsa -in private.pem -pubout -out public.pem
+      - key: IAM_JWT_PRIVATE_KEY
+        sync: false        # set in Render dashboard — never commit to git
+      - key: IAM_JWT_PUBLIC_KEY
+        sync: false        # set in Render dashboard
+
+      # CORS — replace with your Vercel deployment URL
+      - key: CORS_ORIGINS
+        value: https://your-app.vercel.app,http://localhost:3000
+
+      - key: PYTHON_VERSION
+        value: 3.12.0
