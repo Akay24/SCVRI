@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useState, useEffect, PropsWithChildren } from "react";
 import { NavItem } from "@/types/navigation";
 import { useAppStore } from "@/store/useAppStore";
@@ -14,6 +14,7 @@ const navItems: NavItem[] = [
   { label: "Suppliers", href: "/suppliers", roles: ["admin", "analyst"] },
   { label: "Risk Intelligence", href: "/risk-intelligence", roles: ["admin", "analyst"] },
   { label: "Alerts", href: "/alerts", roles: ["admin", "analyst"] },
+  { label: "Shipments", href: "/shipments", roles: ["admin", "analyst"] },
   { label: "Reports", href: "/reports", roles: ["admin", "analyst", "viewer"] },
   { label: "Integrations", href: "/integrations", roles: ["admin"] },
   { label: "Admin", href: "/admin", roles: ["admin"] }
@@ -48,14 +49,22 @@ function MoonIcon() {
 }
 
 export function AppShell({ children }: PropsWithChildren) {
-  const { role, notifications, darkMode, toggleDarkMode } = useAppStore();
+  const { role, notifications, darkMode, toggleDarkMode, clearUser } = useAppStore();
   const pathname = usePathname();
+  const router = useRouter();
   const [bellOpen, setBellOpen] = useState(false);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
 
   /* Sync dark class on <html> */
   useEffect(() => {
     document.documentElement.classList.toggle("dark", darkMode);
   }, [darkMode]);
+
+  async function handleLogout() {
+    await fetch("/api/auth/logout", { method: "POST" });
+    clearUser();
+    router.replace("/login");
+  }
 
   return (
     <div className="flex min-h-screen bg-page">
@@ -140,9 +149,30 @@ export function AppShell({ children }: PropsWithChildren) {
             )}
           </div>
 
-          {/* Avatar */}
-          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-copper text-xs font-semibold uppercase text-white">
-            {role.slice(0, 2)}
+          {/* User menu */}
+          <div className="relative">
+            <button
+              onClick={() => setUserMenuOpen((o) => !o)}
+              className="flex h-8 w-8 items-center justify-center rounded-full bg-copper text-xs font-semibold uppercase text-white hover:opacity-90"
+              aria-label="User menu"
+            >
+              {role.slice(0, 2)}
+            </button>
+
+            {userMenuOpen && (
+              <div className="absolute right-0 top-10 z-50 w-44 rounded-lg border border-stroke bg-card shadow-xl">
+                <div className="border-b border-stroke px-4 py-2.5">
+                  <p className="text-xs font-semibold capitalize text-ink">{role}</p>
+                  <p className="text-xs text-ink-3">SCVRI Platform</p>
+                </div>
+                <button
+                  onClick={handleLogout}
+                  className="w-full px-4 py-2.5 text-left text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20"
+                >
+                  Sign out
+                </button>
+              </div>
+            )}
           </div>
         </header>
 

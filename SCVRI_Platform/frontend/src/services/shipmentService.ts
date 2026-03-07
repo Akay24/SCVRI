@@ -1,20 +1,55 @@
+export interface Shipment {
+  id: string;
+  supplier: string;
+  origin: string;
+  destination: string;
+  mode: "SEA" | "AIR" | "RAIL" | "ROAD";
+  status: "on-track" | "delayed" | "at-risk";
+  eta: string;
+  daysDelayed: number;
+  value: number;
+  containers: number;
+}
+
+export type ShipmentDraft = Omit<Shipment, "id">;
+
 export const shipmentService = {
-  // Delayed shipments by transport mode
-  delays: async () => [
-    { name: "SEA",  value: 18 },
-    { name: "AIR",  value: 5  },
-    { name: "RAIL", value: 9  },
-    { name: "ROAD", value: 12 },
-  ],
-  // On-time vs delayed by week (last 8 weeks)
-  onTimeByWeek: async () => [
-    { name: "W45", onTime: 84, delayed: 16 },
-    { name: "W46", onTime: 80, delayed: 20 },
-    { name: "W47", onTime: 82, delayed: 18 },
-    { name: "W48", onTime: 77, delayed: 23 },
-    { name: "W49", onTime: 79, delayed: 21 },
-    { name: "W50", onTime: 75, delayed: 25 },
-    { name: "W51", onTime: 71, delayed: 29 },
-    { name: "W52", onTime: 73, delayed: 27 },
-  ],
+  list: async (filters: { status?: string; supplier?: string } = {}): Promise<Shipment[]> => {
+    const params = new URLSearchParams();
+    if (filters.status)   params.set("status",   filters.status);
+    if (filters.supplier) params.set("supplier", filters.supplier);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const res = await fetch(`/api/shipments${qs}`, { next: { revalidate: 30 } });
+    if (!res.ok) throw new Error(`Failed to fetch shipments: ${res.status}`);
+    return res.json();
+  },
+
+  create: async (draft: ShipmentDraft): Promise<Shipment> => {
+    const res = await fetch("/api/shipments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(draft),
+    });
+    if (!res.ok) throw new Error(`Failed to create shipment: ${res.status}`);
+    return res.json();
+  },
+
+  update: async (id: string, patch: Partial<ShipmentDraft>): Promise<Shipment> => {
+    const res = await fetch(`/api/shipments/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    if (!res.ok) throw new Error(`Failed to update shipment ${id}: ${res.status}`);
+    return res.json();
+  },
+
+  remove: async (id: string): Promise<void> => {
+    const res = await fetch(`/api/shipments/${id}`, { method: "DELETE" });
+    if (!res.ok) throw new Error(`Failed to delete shipment ${id}: ${res.status}`);
+  },
+
+  // Chart data delegates
+  delays:      () => import("./riskService").then((m) => m.riskService.delays()),
+  onTimeByWeek: () => import("./riskService").then((m) => m.riskService.onTimeByWeek()),
 };

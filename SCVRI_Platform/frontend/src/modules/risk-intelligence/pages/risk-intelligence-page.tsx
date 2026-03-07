@@ -5,7 +5,7 @@ import { Card } from "@/design-system/components/card";
 import { PageTitle } from "@/design-system/components/typography";
 import { LazyLineChart, LazyBarChart } from "@/components/charts/reusable-charts";
 import { riskService } from "@/services/riskService";
-import { suppliers, riskEvents } from "@/services/mockData";
+import { supplierService } from "@/services/supplierService";
 import { RiskScoreBadge } from "@/design-system/components/status-badges";
 
 const TYPE_COLOR: Record<string, string> = {
@@ -31,8 +31,12 @@ export function RiskIntelligencePage() {
   const trend    = useQuery({ queryKey: ["risk-trend"],  queryFn: riskService.trend    });
   const byRegion = useQuery({ queryKey: ["risk-region"], queryFn: riskService.byRegion });
   const byDriver = useQuery({ queryKey: ["risk-driver"], queryFn: riskService.byDriver });
+  const events   = useQuery({ queryKey: ["risk-events"], queryFn: riskService.events  });
+  const suppQ    = useQuery({ queryKey: ["suppliers"],   queryFn: supplierService.list });
 
-  const ranked = [...suppliers].sort((a, b) => b.riskScore - a.riskScore);
+  const suppliers   = suppQ.data ?? [];
+  const riskEvents  = events.data ?? [];
+  const ranked      = [...suppliers].sort((a, b) => b.riskScore - a.riskScore);
   const criticalCount = riskEvents.filter((e) => e.severityScore >= 70).length;
 
   return (
@@ -44,7 +48,7 @@ export function RiskIntelligencePage() {
         <StatCard label="Platform risk score"  value="67"  sub="composite this week"    danger />
         <StatCard label="Critical events"       value={String(criticalCount)} sub="last 30 days" danger />
         <StatCard label="High-risk suppliers"   value={String(suppliers.filter((s) => s.riskScore >= 70).length)} sub="score ≥ 70" />
-        <StatCard label="Spend exposed"         value="$9.1M" sub="at-risk suppliers" />
+        <StatCard label="Spend exposed"         value={`$${(suppliers.filter(s => s.riskScore >= 70).reduce((acc, s) => acc + s.spend, 0) / 1_000_000).toFixed(1)}M`} sub="at-risk suppliers" />
       </div>
 
       {/* Charts row */}
@@ -110,6 +114,9 @@ export function RiskIntelligencePage() {
       {/* Risk event timeline */}
       <Card>
           <p className="mb-4 font-semibold text-ink-2">Risk event timeline</p>
+          {events.isLoading ? (
+            <div className="h-40 animate-pulse rounded bg-surface" />
+          ) : (
           <div className="space-y-2">
             {riskEvents.map((e) => (
               <div key={e.date + e.title} className="flex items-start gap-4 rounded-lg border border-stroke bg-surface px-4 py-3">
@@ -131,6 +138,7 @@ export function RiskIntelligencePage() {
             </div>
           ))}
         </div>
+          )}
       </Card>
     </div>
   );

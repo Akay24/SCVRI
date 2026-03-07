@@ -3,10 +3,11 @@
 import "maplibre-gl/dist/maplibre-gl.css";
 import maplibregl from "maplibre-gl";
 import { useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Card } from "@/design-system/components/card";
 import { Drawer } from "@/design-system/components/overlays";
 import { PageTitle } from "@/design-system/components/typography";
-import { suppliers } from "@/services/mockData";
+import { supplierService, type Supplier } from "@/services/supplierService";
 
 // Free OpenFreeMap tile style — no token required
 const MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
@@ -30,15 +31,18 @@ const COORDS: Record<string, [number, number]> = {
 const RISK_COLOR = (score: number) =>
   score >= 70 ? "#ef4444" : score >= 45 ? "#f97316" : "#22c55e";
 
-type SupplierPoint = (typeof suppliers)[number];
-
 export function SupplyChainMapPage() {
   const mapRef = useRef<HTMLDivElement>(null);
-  const [selected, setSelected] = useState<SupplierPoint | null>(null);
+  const [selected, setSelected] = useState<Supplier | null>(null);
   const [mapReady, setMapReady] = useState(false);
 
+  const { data: suppliers = [] } = useQuery({
+    queryKey: ["suppliers"],
+    queryFn: supplierService.list,
+  });
+
   useEffect(() => {
-    if (!mapRef.current) return;
+    if (!mapRef.current || suppliers.length === 0) return;
 
     const map = new maplibregl.Map({
       container: mapRef.current,
@@ -79,7 +83,7 @@ export function SupplyChainMapPage() {
       handlers.forEach((cleanup) => cleanup());
       map.remove();
     };
-  }, []);
+  }, [suppliers]);
 
   return (
     <div className="space-y-4">
