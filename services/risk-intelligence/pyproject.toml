@@ -32,7 +32,7 @@ dependencies = [
     "redis[hiredis]==5.2.0",
     "aiokafka==0.11.0",
     # Observability
-    "opentelemetry-sdk==1.29.0",
+    "opentelemetry-sdk==1.40.0",
     "opentelemetry-instrumentation-fastapi==0.50b0",
     "opentelemetry-exporter-otlp-proto-grpc==1.29.0",
 ]
