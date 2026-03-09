@@ -21,7 +21,7 @@ dependencies = [
     "aiosmtplib==3.0.2",     # async SMTP for email notifications
     "jinja2==3.1.4",         # notification templates
     "tenacity==9.0.0",
-    "structlog==24.4.0",
+    "structlog==25.5.0",
     "scvri-shared @ file://../../shared",
 ]
 
