@@ -15,7 +15,7 @@ dependencies = [
     "asyncpg==0.30.0",
     "alembic==1.14.0",
     "redis==5.2.1",
-    "celery==5.4.0",
+    "celery==5.6.2",
     "python-jose[cryptography]==3.3.0",   # JWT RS256 signing / verification
     "passlib[bcrypt]==1.7.4",              # bcrypt password hashing
     "pyotp==2.9.0",                        # TOTP MFA (RFC 6238)
