@@ -32,7 +32,7 @@ dev = [
     "pytest-cov==6.0.0",
     "httpx==0.28.1",
     "freezegun==1.5.1",
-    "respx==0.21.1",          # mock httpx for webhook tests
+    "respx==0.22.0",          # mock httpx for webhook tests
 ]
 
 [tool.hatch.metadata]
