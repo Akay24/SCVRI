@@ -4,8 +4,9 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
+
 
 from alert_engine.dependencies import (
     TenantDB,
@@ -66,15 +67,17 @@ async def update_rule(
     return await rule_service.update_rule(db, tenant_id, rule_id, data)
 
 
-@router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response, response_model=None)
 async def delete_rule(
     rule_id: uuid.UUID,
     db: DbDep,
     tenant_id: TenantID,
     _: AdminDep,
-) -> None:
+) -> Response:
     """Soft-delete an alert rule (admin only)."""
     await rule_service.delete_rule(db, tenant_id, rule_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 
 @router.post("/{rule_id}/test")

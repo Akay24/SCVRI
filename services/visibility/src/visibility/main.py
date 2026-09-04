@@ -51,9 +51,10 @@ def create_app() -> FastAPI:
 
     register_middleware(application)
 
-    application.include_router(po_router, prefix="/v1")
-    application.include_router(shipments_router, prefix="/v1")
-    application.include_router(telemetry_router, prefix="/v1")
+    for prefix in ("/api/v1", "/v1"):
+        application.include_router(po_router, prefix=prefix)
+        application.include_router(shipments_router, prefix=prefix)
+        application.include_router(telemetry_router, prefix=prefix)
 
     @application.get("/health", tags=["Health"], include_in_schema=False)
     async def health() -> JSONResponse:

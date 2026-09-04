@@ -77,7 +77,7 @@ async def _async_erp_sync_pos() -> dict:
             system_user_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
             async with async_session() as db:
-                await db.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+                await db.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
 
                 exists = (await db.execute(text("""
                     SELECT id, status FROM visibility.purchase_orders
@@ -181,7 +181,7 @@ async def _async_reconcile_shipments() -> dict:
             shipment_id = uuid.UUID(str(shipment["id"]))
 
             async with async_session() as db:
-                await db.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+                await db.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
 
                 event_in = TrackingEventCreate(
                     shipment_id=shipment_id,

@@ -44,10 +44,13 @@ def test_create_and_decode_access_token():
     claims = decode_access_token(token)
 
     assert claims["sub"] == str(USER_ID)
+    assert claims["tid"] == str(TENANT_ID)
     assert claims["tenant_id"] == str(TENANT_ID)
     assert claims["role"] == "viewer"
     assert claims["email"] == TEST_EMAIL
     assert claims["token_type"] == "access"
+    assert "iss" in claims
+    assert "aud" in claims
     assert "jti" in claims
     assert claims["exp"] > claims["iat"]
 
@@ -136,7 +139,7 @@ def test_totp_provisioning_uri_format():
     secret = generate_totp_secret()
     uri = get_totp_provisioning_uri(secret, TEST_EMAIL)
     assert uri.startswith("otpauth://totp/")
-    assert TEST_EMAIL in uri
+    assert "test%40acme.scvri.io" in uri or TEST_EMAIL in uri
 
 
 def test_totp_qr_code_is_base64_png():

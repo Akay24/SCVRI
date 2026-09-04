@@ -50,7 +50,7 @@ async def consume_iot_telemetry() -> None:
                 tenant_id = payload.tenant_id or uuid.UUID(message.value.get("tenant_id", ""))
 
                 async with async_session() as db:
-                    await db.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+                    await db.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
                     await telemetry_service.process_telemetry(db, tenant_id, payload)
 
             except Exception as exc:  # noqa: BLE001
@@ -103,7 +103,7 @@ async def consume_erp_purchase_orders() -> None:
                 if event_type == "erp.po.created":
                     po_in = PurchaseOrderCreate(**payload_data)
                     async with async_session() as db:
-                        await db.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+                        await db.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
                         # Idempotency: skip if po_number already exists
                         exists = (await db.execute(text("""
                             SELECT 1 FROM visibility.purchase_orders
@@ -118,7 +118,7 @@ async def consume_erp_purchase_orders() -> None:
                     po_id = uuid.UUID(payload_data["po_id"])
                     event = payload_data.get("event", "confirm")
                     async with async_session() as db:
-                        await db.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+                        await db.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
                         await po_service.apply_po_event(
                             db, tenant_id, system_user_id, po_id,
                             POEventRequest(event=event, notes="Applied from ERP event"),
@@ -171,7 +171,7 @@ async def consume_supplier_events() -> None:
                 supplier_id = uuid.UUID(payload_data["supplier_id"])
 
                 async with async_session() as db:
-                    await db.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+                    await db.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
                     # Flag all open POs with a note
                     await db.execute(text("""
                         UPDATE visibility.purchase_orders

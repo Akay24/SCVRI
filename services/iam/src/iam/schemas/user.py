@@ -73,6 +73,10 @@ class UserResponse(CamelBase):
     created_at: datetime
     updated_at: datetime
 
+    @property
+    def user_id(self) -> uuid.UUID:
+        return self.id
+
 
 class UserPasswordChange(CamelBase):
     current_password: str
@@ -124,6 +128,14 @@ class SCIMUserName(CamelBase):
     given_name: str | None = None
     family_name: str | None = None
 
+    @property
+    def givenName(self) -> str | None:
+        return self.given_name
+
+    @property
+    def familyName(self) -> str | None:
+        return self.family_name
+
 
 class SCIMEmail(CamelBase):
     value: str
@@ -144,13 +156,26 @@ class SCIMUserCreate(CamelBase):
 class SCIMUserResponse(CamelBase):
     """SCIM 2.0 User response resource."""
     schemas: list[str] = ["urn:ietf:params:scim:schemas:core:2.0:User"]
-    id: str
-    external_id: str | None
+    id: str | uuid.UUID
+    external_id: str | None = None
     user_name: str
-    name: SCIMUserName | None
-    emails: list[SCIMEmail]
-    active: bool
-    meta: dict
+    name: SCIMUserName | None = None
+    emails: list[SCIMEmail] = []
+    active: bool = True
+    meta: dict = {}
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def coerce_id(cls, v: Any) -> str:
+        return str(v)
+
+    @property
+    def userName(self) -> str:
+        return self.user_name
+
+    @property
+    def externalId(self) -> str | None:
+        return self.external_id
 
 
 class SCIMListResponse(CamelBase):

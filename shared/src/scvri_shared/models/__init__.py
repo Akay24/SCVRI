@@ -55,6 +55,7 @@ from scvri_shared.models.compliance import (
     ErasureRequest,
 )
 from scvri_shared.models.audit import AuditLog
+from scvri_shared.models.outbox import OutboxEvent
 
 __all__ = [
     # Base
@@ -101,4 +102,6 @@ __all__ = [
     "ErasureRequest",
     # Audit
     "AuditLog",
+    # Outbox
+    "OutboxEvent",
 ]

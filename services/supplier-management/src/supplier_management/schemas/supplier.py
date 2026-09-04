@@ -5,20 +5,24 @@ import uuid
 from datetime import date, datetime
 from typing import Annotated, Any
 
-from pydantic import EmailStr, Field, HttpUrl, field_validator
+from pydantic import EmailStr, Field, HttpUrl, field_validator, model_validator
 
 from scvri_shared.schemas import CamelBase, TimestampSchema
 
 # ---------------------------------------------------------------------------
 # Enums mirrored from SQLAlchemy models (used in Pydantic validators)
 # ---------------------------------------------------------------------------
-VALID_STATUSES = {"draft", "active", "suspended", "deactivated", "banned"}
+VALID_STATUSES = {"draft", "active", "suspended", "deactivated", "banned", "inactive"}
 VALID_ONBOARDING = {
+    "draft", "submitted", "under_review", "returned", "approved", "rejected", "active", "suspended", "inactive",
     "pending_onboarding", "questionnaire_sent", "questionnaire_in_progress",
-    "documents_requested", "under_review", "compliance_check",
-    "approved", "rejected", "active",
+    "documents_requested", "compliance_check",
 }
-VALID_TIERS = {"strategic", "preferred", "standard", "one_time"}
+
+VALID_TIERS = {
+    "strategic", "preferred", "standard", "one_time",
+    "tier_1", "tier_2", "tier_3", "tier_4",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +105,8 @@ class DiversityInfo(CamelBase):
 # Supplier Create / Update
 # ---------------------------------------------------------------------------
 class SupplierCreate(CamelBase):
-    legal_name: str = Field(min_length=1, max_length=500)
+    name: str | None = None
+    legal_name: str = Field(default="", max_length=500)
     trading_name: str | None = Field(default=None, max_length=500)
     duns_number: str | None = Field(default=None, min_length=9, max_length=9)
     tax_id: str | None = Field(default=None, max_length=50)
@@ -114,6 +119,8 @@ class SupplierCreate(CamelBase):
     address_line_2: str | None = Field(default=None, max_length=500)
     geo_region: str | None = Field(default=None, max_length=50)
     tier: str = Field(default="standard")
+    supplier_tier: str | None = None
+    industry_code: str | None = Field(default=None, max_length=50)
     primary_category: str | None = Field(default=None, max_length=200)
     secondary_categories: list[str] | None = None
     commodity_codes: list[str] | None = None
@@ -128,6 +135,26 @@ class SupplierCreate(CamelBase):
     # Initial contacts (optional — can be added separately)
     contacts: list[ContactCreate] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("legal_name") and data.get("name"):
+                data["legal_name"] = data["name"]
+            elif not data.get("name") and data.get("legal_name"):
+                data["name"] = data["legal_name"]
+            if "supplier_tier" in data:
+                data["tier"] = data["supplier_tier"]
+        return data
+
+    @model_validator(mode="after")
+    def _validate_required_name(self) -> "SupplierCreate":
+        if not self.legal_name and not self.name:
+            raise ValueError("legal_name or name is required")
+        if not self.legal_name:
+            self.legal_name = self.name or ""
+        return self
+
     @field_validator("tier")
     @classmethod
     def validate_tier(cls, v: str) -> str:
@@ -139,6 +166,7 @@ class SupplierCreate(CamelBase):
     @classmethod
     def validate_country_code(cls, v: str) -> str:
         return v.upper()
+
 
 
 class SupplierUpdate(CamelBase):

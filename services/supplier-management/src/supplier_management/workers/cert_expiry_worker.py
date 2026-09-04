@@ -58,7 +58,7 @@ def check_cert_expiry() -> dict:
         today = date.today()
 
         for tenant_id in tenants:
-            sess.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+            sess.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
 
             for days_ahead, event_type in _ALERT_WINDOWS:
                 target_date = today + timedelta(days=days_ahead)

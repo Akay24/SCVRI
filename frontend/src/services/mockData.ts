@@ -52,4 +52,44 @@ export const shipments = [
   { id: "SHP-5008", supplier: "SUP-003", origin: "Gothenburg",destination: "Glasgow",  mode: "SEA",  status: "on-track",  eta: "2026-03-10", daysDelayed: 0,  value: 165000, containers: 1 },
   { id: "SHP-5009", supplier: "SUP-006", origin: "Houston",  destination: "São Paulo", mode: "AIR",  status: "at-risk",   eta: "2026-03-08", daysDelayed: 2,  value: 77000,  containers: 1 },
   { id: "SHP-5010", supplier: "SUP-011", origin: "Alexandria",destination: "Barcelona",mode: "SEA",  status: "delayed",   eta: "2026-03-22", daysDelayed: 7,  value: 112000, containers: 1 },
-] as const;
+];
+
+// ─── Risk metrics ─────────────────────────────────────────────────────────────
+export const riskMetrics = {
+  trend: [
+    { name: "W40", value: 41 }, { name: "W41", value: 39 }, { name: "W42", value: 44 },
+    { name: "W43", value: 47 }, { name: "W44", value: 43 }, { name: "W45", value: 50 },
+    { name: "W46", value: 55 }, { name: "W47", value: 52 }, { name: "W48", value: 61 },
+    { name: "W49", value: 58 }, { name: "W50", value: 64 }, { name: "W51", value: 70 },
+    { name: "W52", value: 67 },
+  ],
+  byRegion: [
+    { name: "AMER", value: 38 },
+    { name: "EU",   value: 44 },
+    { name: "EMEA", value: 63 },
+    { name: "APAC", value: 71 },
+  ],
+  byDriver: [
+    { name: "Weather",      value: 28 }, { name: "Financial",    value: 22 },
+    { name: "Transport",    value: 19 }, { name: "Geopolitical", value: 14 },
+    { name: "ESG",          value: 9  }, { name: "Capacity",     value: 8  },
+  ],
+  shipmentDelays: [
+    { name: "SEA",  value: 18 }, { name: "AIR",  value: 5 },
+    { name: "RAIL", value: 9  }, { name: "ROAD", value: 12 },
+  ],
+  onTimeByWeek: [
+    { name: "W45", onTime: 84, delayed: 16 }, { name: "W46", onTime: 80, delayed: 20 },
+    { name: "W47", onTime: 82, delayed: 18 }, { name: "W48", onTime: 77, delayed: 23 },
+    { name: "W49", onTime: 79, delayed: 21 }, { name: "W50", onTime: 75, delayed: 25 },
+    { name: "W51", onTime: 71, delayed: 29 }, { name: "W52", onTime: 73, delayed: 27 },
+  ],
+};
+
+// ─── Reports ──────────────────────────────────────────────────────────────────
+export const reports = [
+  { id: "RPT-001", title: "Weekly Supplier Risk Summary",     description: "Consolidated risk scores and alerts for all active suppliers, ranked by exposure.",       category: "risk",       lastRun: "2026-03-03T08:00:00Z", lastFormat: "PDF" },
+  { id: "RPT-002", title: "Shipment Delay Analysis",          description: "Breakdown of delayed shipments by mode, region, and root cause for the past 4 weeks.",     category: "logistics",  lastRun: "2026-03-01T12:00:00Z", lastFormat: "CSV" },
+  { id: "RPT-003", title: "ESG Compliance Audit Report",      description: "Supplier ESG scores, audit findings, and remediation status across all tier 1 & 2 vendors.",category: "compliance", lastRun: "2026-02-24T09:00:00Z", lastFormat: "PDF" },
+  { id: "RPT-004", title: "Financial Exposure Dashboard",     description: "Spend concentration, credit risk flags, and open PO values per supplier and region.",       category: "finance",    lastRun: "2026-02-20T14:00:00Z", lastFormat: "XLSX" },
+];

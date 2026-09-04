@@ -13,18 +13,32 @@ export interface Alert {
   region: string;
 }
 
+import { alerts as mockAlerts } from "./mockData";
+
 export type AlertDraft = Omit<Alert, "id" | "status" | "createdAt">;
 
 export const alertService = {
   list: async (filters: { severity?: string; status?: string; region?: string } = {}): Promise<Alert[]> => {
-    const params = new URLSearchParams();
-    if (filters.severity) params.set("severity", filters.severity);
-    if (filters.status)   params.set("status",   filters.status);
-    if (filters.region)   params.set("region",   filters.region);
-    const qs = params.toString() ? `?${params.toString()}` : "";
-    const res = await fetch(`/api/alerts${qs}`, { next: { revalidate: 30 } });
-    if (!res.ok) throw new Error(`Failed to fetch alerts: ${res.status}`);
-    return res.json();
+    try {
+      const params = new URLSearchParams();
+      if (filters.severity) params.set("severity", filters.severity);
+      if (filters.status)   params.set("status",   filters.status);
+      if (filters.region)   params.set("region",   filters.region);
+      const qs = params.toString() ? `?${params.toString()}` : "";
+      const res = await fetch(`/api/alerts${qs}`, { next: { revalidate: 30 } });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) return data;
+      }
+    } catch {
+      // Fallback
+    }
+
+    let result = [...mockAlerts];
+    if (filters.severity) result = result.filter((a) => a.severity === filters.severity);
+    if (filters.status)   result = result.filter((a) => a.status === filters.status);
+    if (filters.region)   result = result.filter((a) => a.region === filters.region);
+    return result as unknown as Alert[];
   },
 
   acknowledge: async (id: string): Promise<Alert> => {

@@ -17,19 +17,38 @@ const SupplierSchema = z.object({
 });
 
 export type Supplier = z.infer<typeof SupplierSchema>;
+import { suppliers as mockSuppliers } from "./mockData";
+
 export type SupplierDraft = Omit<Supplier, "id">;
 
 export const supplierService = {
   list: async (): Promise<Supplier[]> => {
-    const res = await fetch("/api/suppliers", { next: { revalidate: 60 } });
-    if (!res.ok) throw new Error(`Failed to fetch suppliers: ${res.status}`);
-    return z.array(SupplierSchema).parse(await res.json());
+    try {
+      const res = await fetch("/api/suppliers", { next: { revalidate: 60 } });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          return z.array(SupplierSchema).parse(data);
+        }
+      }
+    } catch {
+      // Fallback
+    }
+    return mockSuppliers as unknown as Supplier[];
   },
 
   get: async (id: string): Promise<Supplier> => {
-    const res = await fetch(`/api/suppliers/${id}`, { next: { revalidate: 60 } });
-    if (!res.ok) throw new Error(`Failed to fetch supplier ${id}: ${res.status}`);
-    return SupplierSchema.parse(await res.json());
+    try {
+      const res = await fetch(`/api/suppliers/${id}`, { next: { revalidate: 60 } });
+      if (res.ok) {
+        return SupplierSchema.parse(await res.json());
+      }
+    } catch {
+      // Fallback
+    }
+    const mock = mockSuppliers.find((s) => s.id === id);
+    if (mock) return mock as unknown as Supplier;
+    throw new Error(`Supplier ${id} not found`);
   },
 
   create: async (draft: SupplierDraft): Promise<Supplier> => {

@@ -1,8 +1,6 @@
 import { MongoClient, Db } from "mongodb";
 
-const MONGODB_URI =
-  process.env.MONGODB_URI ||
-  "mongodb+srv://akayroot:lGO2BiUGJmU3plo1@cluster0.g9lsetd.mongodb.net/?retryWrites=true&w=majority";
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/SCVRI";
 
 const DB_NAME = process.env.MONGODB_DB || "SCVRI";
 

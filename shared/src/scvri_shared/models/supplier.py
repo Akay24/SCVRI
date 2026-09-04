@@ -448,3 +448,11 @@ class SupplierScorecard(Base, UUIDPrimaryKeyMixin, TenantMixin, TimestampMixin):
     )
 
     supplier: Mapped[Supplier] = relationship("Supplier", back_populates="scorecards", lazy="noload")
+
+
+# Backward-compatible model aliases
+Contact = SupplierContact
+Certification = SupplierCertification
+Document = SupplierDocument
+Scorecard = SupplierScorecard
+

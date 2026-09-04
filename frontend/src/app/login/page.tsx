@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, FormEvent } from "react";
+import { useState, FormEvent, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useAppStore } from "@/store/useAppStore";
 import { Role } from "@/types/navigation";
@@ -8,7 +8,7 @@ import { Role } from "@/types/navigation";
 const inputCls =
   "w-full rounded-md border border-stroke bg-surface px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none placeholder:text-ink-3";
 
-export default function LoginPage() {
+function LoginForm() {
   const router = useRouter();
   const params = useSearchParams();
   const setUser = useAppStore((s) => s.setUser);
@@ -129,6 +129,58 @@ export default function LoginPage() {
                 >
                   {loading ? "Signing in…" : "Sign in"}
                 </button>
+
+                <div className="mt-4 border-t border-stroke pt-4">
+                  <p className="mb-2 text-center text-xs font-medium text-ink-3">
+                    Demo Accounts (click to fill):
+                  </p>
+                  <div className="grid grid-cols-2 gap-1.5 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEmail("admin@scvri.dev");
+                        setPassword("Admin1234!");
+                        setError("");
+                      }}
+                      className="rounded border border-stroke bg-surface px-2 py-1 text-ink-2 transition hover:border-accent hover:text-ink"
+                    >
+                      Admin
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEmail("manager@scvri.dev");
+                        setPassword("Manager1!");
+                        setError("");
+                      }}
+                      className="rounded border border-stroke bg-surface px-2 py-1 text-ink-2 transition hover:border-accent hover:text-ink"
+                    >
+                      Manager
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEmail("analyst@scvri.dev");
+                        setPassword("Analyst1!");
+                        setError("");
+                      }}
+                      className="rounded border border-stroke bg-surface px-2 py-1 text-ink-2 transition hover:border-accent hover:text-ink"
+                    >
+                      Analyst
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEmail("viewer@scvri.dev");
+                        setPassword("Viewer12!");
+                        setError("");
+                      }}
+                      className="rounded border border-stroke bg-surface px-2 py-1 text-ink-2 transition hover:border-accent hover:text-ink"
+                    >
+                      Viewer
+                    </button>
+                  </div>
+                </div>
               </form>
             </>
           ) : (
@@ -176,5 +228,13 @@ export default function LoginPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<div className="flex min-h-screen items-center justify-center bg-page" />}>
+      <LoginForm />
+    </Suspense>
   );
 }

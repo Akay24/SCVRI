@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from iam.core.security import hash_password, verify_password
-from iam.schemas.user import UserCreate, UserResponse, UserUpdate
+from iam.schemas.user import UserCreate, UserPasswordChange, UserResponse, UserUpdate
 from scvri_shared.exceptions import AuthenticationError, ConflictError, NotFoundError
 from scvri_shared.logging import get_logger
 
@@ -18,40 +20,59 @@ log = get_logger(__name__)
 
 async def create_user(
     db: AsyncSession,
-    tenant_id: uuid.UUID,
-    data: UserCreate,
+    tenant_id_or_data: uuid.UUID | UserCreate,
+    data: UserCreate | None = None,
     created_by: uuid.UUID | None = None,
 ) -> UserResponse:
-    # Uniqueness check within tenant
-    existing = (await db.execute(text("""
-        SELECT id FROM iam.users WHERE email = :email AND tenant_id = :tenant_id
-    """), {"email": data.email.lower(), "tenant_id": str(tenant_id)})).scalar_one_or_none()
-
-    if existing is not None:
-        raise ConflictError(f"Email '{data.email}' already registered for this tenant")
+    if isinstance(tenant_id_or_data, UserCreate):
+        user_create = tenant_id_or_data
+        tenant_id = user_create.tenant_id
+        if tenant_id is None:
+            raise ValueError("tenant_id must be provided on UserCreate payload")
+    else:
+        tenant_id = tenant_id_or_data
+        user_create = data
+        if user_create is None:
+            raise ValueError("data must be provided")
 
     user_id = uuid.uuid4()
-    pw_hash = hash_password(data.password)
+    pw_hash = hash_password(user_create.password)
 
-    await db.execute(text("""
-        INSERT INTO iam.users
-            (id, tenant_id, email, full_name, password_hash, role, status,
-             mfa_enabled, mfa_method, created_by, created_at, updated_at)
-        VALUES
-            (:id, :tenant_id, :email, :full_name, :pw_hash, :role, 'active',
-             FALSE, 'none', :created_by, now(), now())
-    """), {
-        "id": str(user_id),
-        "tenant_id": str(tenant_id),
-        "email": data.email.lower(),
-        "full_name": data.full_name,
-        "pw_hash": pw_hash,
-        "role": data.role,
-        "created_by": str(created_by) if created_by else None,
-    })
-    await db.commit()
+    try:
+        result = await db.execute(text("""
+            INSERT INTO iam.users
+                (id, tenant_id, email, full_name, password_hash, role, status,
+                 mfa_enabled, mfa_method, created_by, created_at, updated_at)
+            VALUES
+                (:id, :tenant_id, :email, :full_name, :pw_hash, :role, 'active',
+                 FALSE, 'none', :created_by, now(), now())
+            RETURNING id, tenant_id, email, full_name, role, status,
+                      mfa_enabled, mfa_method, created_by, created_at, updated_at
+        """), {
+            "id": str(user_id),
+            "tenant_id": str(tenant_id),
+            "email": user_create.email.lower(),
+            "full_name": user_create.full_name,
+            "pw_hash": pw_hash,
+            "role": user_create.role,
+            "created_by": str(created_by) if created_by else None,
+        })
+        await db.commit()
+    except IntegrityError as exc:
+        raise ConflictError(f"Email '{user_create.email}' already registered for this tenant") from exc
 
     log.info("user.created", user_id=str(user_id), tenant_id=str(tenant_id))
+
+    if hasattr(result, "mappings"):
+        mappings = result.mappings()
+        if hasattr(mappings, "one"):
+            row = mappings.one()
+            return _map_user(row)
+        elif hasattr(mappings, "one_or_none"):
+            row = mappings.one_or_none()
+            if row:
+                return _map_user(row)
+
     return await get_user(db, tenant_id, user_id)
 
 
@@ -141,11 +162,12 @@ async def delete_user(
     user_id: uuid.UUID,
 ) -> None:
     """Soft-delete — set status to inactive."""
-    await get_user(db, tenant_id, user_id)
-    await db.execute(text("""
+    result = await db.execute(text("""
         UPDATE iam.users SET status = 'inactive', updated_at = now()
         WHERE id = :id AND tenant_id = :tenant_id
     """), {"id": str(user_id), "tenant_id": str(tenant_id)})
+    if getattr(result, "rowcount", None) == 0:
+        raise NotFoundError(f"User {user_id} not found")
     await db.commit()
 
 
@@ -155,9 +177,17 @@ async def change_password(
     db: AsyncSession,
     tenant_id: uuid.UUID,
     user_id: uuid.UUID,
-    current_password: str,
-    new_password: str,
+    current_password_or_data: str | UserPasswordChange,
+    new_password: str | None = None,
 ) -> None:
+    if isinstance(current_password_or_data, UserPasswordChange):
+        current_password = current_password_or_data.current_password
+        new_password = current_password_or_data.new_password
+    else:
+        current_password = current_password_or_data
+        if new_password is None:
+            raise ValueError("new_password must be provided")
+
     row = (await db.execute(text("""
         SELECT password_hash FROM iam.users
         WHERE id = :id AND tenant_id = :tenant_id
@@ -179,17 +209,22 @@ async def change_password(
 
 # ── Mapper ────────────────────────────────────────────────────────────────────
 
-def _map_user(row: dict) -> UserResponse:
+def _map_user(row: dict | Any) -> UserResponse:
+    def get_val(key: str, default: Any = None) -> Any:
+        if isinstance(row, dict):
+            return row.get(key, default)
+        return getattr(row, key, default)
+
     return UserResponse(
-        id=row["id"],
-        tenant_id=row["tenant_id"],
-        email=row["email"],
-        full_name=row["full_name"],
-        role=row["role"],
-        status=row["status"],
-        mfa_method=row.get("mfa_method", "none"),
-        mfa_enabled=bool(row.get("mfa_enabled", False)),
-        last_login_at=row.get("last_login_at"),
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+        id=get_val("id"),
+        tenant_id=get_val("tenant_id"),
+        email=get_val("email"),
+        full_name=get_val("full_name"),
+        role=get_val("role"),
+        status=get_val("status"),
+        mfa_method=get_val("mfa_method", "none"),
+        mfa_enabled=bool(get_val("mfa_enabled", False)),
+        last_login_at=get_val("last_login_at"),
+        created_at=get_val("created_at"),
+        updated_at=get_val("updated_at"),
     )

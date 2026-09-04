@@ -112,7 +112,10 @@ def create_access_token(
     now = int(time.time())
     jti = str(uuid.uuid4())
     payload: dict[str, Any] = {
+        "iss": getattr(settings, "jwt_issuer", "http://localhost:8000"),
+        "aud": getattr(settings, "jwt_audience", "http://localhost"),
         "sub": str(user_id),
+        "tid": str(tenant_id),
         "tenant_id": str(tenant_id),
         "role": role,
         "email": email,
@@ -130,7 +133,13 @@ def decode_access_token(token: str) -> dict[str, Any]:
     Verify and decode an RS256 JWT.
     Raises jose.JWTError on invalid / expired tokens.
     """
-    return jwt.decode(token, get_public_key(), algorithms=[ALGORITHM])
+    aud = getattr(settings, "jwt_audience", None)
+    return jwt.decode(
+        token,
+        get_public_key(),
+        algorithms=[ALGORITHM],
+        audience=aud,
+    )
 
 
 # ── Refresh token ─────────────────────────────────────────────────────────────

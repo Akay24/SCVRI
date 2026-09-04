@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scvri_shared.exceptions import NotFoundError, BusinessRuleError
 from scvri_shared.kafka import get_producer
+from scvri_shared.outbox_relay import schedule_outbox_event
 from scvri_shared.logging import get_logger
 from visibility.schemas.purchase_order import (
     PO_TRANSITIONS,
@@ -211,35 +212,57 @@ async def apply_po_event(
     if event.line_updates:
         await _apply_line_updates(db, po_id, event.event, event.line_updates)
 
+    # Schedule Outbox event for zero-loss reliable delivery
+    await schedule_outbox_event(
+        db,
+        tenant_id=tenant_id,
+        topic="visibility.events",
+        event_type="po.status.changed",
+        payload={
+            "po_id": str(po_id),
+            "supplier_id": str(po.supplier_id),
+            "previous_status": current,
+            "new_status": next_status,
+            "event": event.event,
+            "notes": event.notes,
+            "changed_by": str(user_id),
+        },
+        event_key=str(po_id),
+    )
+
     await db.commit()
 
     updated_po = await get_purchase_order(db, tenant_id, po_id)
 
-    # Publish Kafka event
-    async with get_producer() as producer:
-        await producer.send(
-            topic="visibility.events",
-            event_type="po.status.changed",
-            payload={
-                "po_id": str(po_id),
-                "supplier_id": str(po.supplier_id),
-                "previous_status": current,
-                "new_status": next_status,
-                "event": event.event,
-                "notes": event.notes,
-                "changed_by": str(user_id),
-            },
-            tenant_id=str(tenant_id),
-        )
+    # Publish Kafka event opportunistically
+    try:
+        async with get_producer() as producer:
+            await producer.send(
+                topic="visibility.events",
+                event_type="po.status.changed",
+                payload={
+                    "po_id": str(po_id),
+                    "supplier_id": str(po.supplier_id),
+                    "previous_status": current,
+                    "new_status": next_status,
+                    "event": event.event,
+                    "notes": event.notes,
+                    "changed_by": str(user_id),
+                },
+                tenant_id=str(tenant_id),
+            )
+    except Exception as exc:
+        log.warning("po_event_direct_publish_failed_relaying_via_outbox", error=str(exc))
 
     log.info(
         "po.event.applied",
         po_id=str(po_id),
-        event=event.event,
+        po_event=event.event,
         from_status=current,
         to_status=next_status,
     )
     return updated_po
+
 
 
 def _timestamp_columns(event: str) -> str:

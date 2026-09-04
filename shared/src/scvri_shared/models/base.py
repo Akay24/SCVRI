@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, String, func, text
+from sqlalchemy import DateTime, ForeignKey, String, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -76,7 +76,7 @@ class TenantMixin:
     """
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+        ForeignKey("platform.tenants.id"),
         nullable=False,
         index=True,
     )

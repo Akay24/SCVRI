@@ -51,7 +51,7 @@ class TokenClaims:
     """Validated claims attached to the request."""
     def __init__(self, claims: dict):
         self.user_id: uuid.UUID = uuid.UUID(claims["sub"])
-        self.tenant_id: uuid.UUID = uuid.UUID(claims["tenant_id"])
+        self.tenant_id: uuid.UUID = uuid.UUID(claims.get("tenant_id") or claims["tid"])
         self.role: str = claims["role"]
         self.email: str = claims["email"]
         self.jti: str = claims["jti"]

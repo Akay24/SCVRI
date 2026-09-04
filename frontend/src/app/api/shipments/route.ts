@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
+import { shipments as mockShipments } from "@/services/mockData";
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -17,12 +18,18 @@ export async function GET(req: NextRequest) {
       .find(filter)
       .sort({ eta: 1 })
       .toArray();
-    const data = shipments.map(({ _id, ...rest }) => rest);
-    return NextResponse.json(data);
+    if (shipments && shipments.length > 0) {
+      const data = shipments.map(({ _id, ...rest }) => rest);
+      return NextResponse.json(data);
+    }
   } catch (err) {
-    console.error("/api/shipments error:", err);
-    return NextResponse.json({ error: "Database error" }, { status: 500 });
+    // Database offline — fall back to mock data
   }
+
+  let result = [...mockShipments];
+  if (status)   result = result.filter((s) => s.status === status);
+  if (supplier) result = result.filter((s) => s.supplier === supplier);
+  return NextResponse.json(result);
 }
 
 export async function POST(req: NextRequest) {

@@ -15,10 +15,27 @@ class ScorecardCreate(CamelBase):
     period_end: date
     total_deliveries: int = Field(ge=0)
     on_time_deliveries: int = Field(ge=0)
-    items_ordered: int = Field(ge=0)
-    items_received: int = Field(ge=0)
-    returned_items: int = Field(ge=0)
-    invoice_discrepancy_pct: float = Field(ge=0.0, le=100.0)
+    items_ordered: int = Field(default=0, ge=0)
+    items_received: int = Field(default=0, ge=0)
+    returned_items: int = Field(default=0, ge=0)
+    invoice_discrepancy_pct: float = Field(default=0.0, ge=0.0, le=100.0)
+
+    # Alternate naming support (e.g. quantity_ordered, quantity_received, quantity_returned)
+    quantity_ordered: int | None = None
+    quantity_received: int | None = None
+    quantity_returned: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_quantities(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "quantity_ordered" in data and "items_ordered" not in data:
+                data["items_ordered"] = data["quantity_ordered"]
+            if "quantity_received" in data and "items_received" not in data:
+                data["items_received"] = data["quantity_received"]
+            if "quantity_returned" in data and "returned_items" not in data:
+                data["returned_items"] = data["quantity_returned"]
+        return data
 
     @model_validator(mode="after")
     def validate_counts(self) -> "ScorecardCreate":

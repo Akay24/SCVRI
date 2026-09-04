@@ -140,6 +140,28 @@ class SCVRIProducer:
             self._started = False
             log.info("kafka.producer.stopped")
 
+    async def send(
+        self,
+        *,
+        topic: str,
+        event_type: str,
+        payload: dict[str, Any],
+        tenant_id: str | None = None,
+        key: str | None = None,
+        correlation_id: str = "-",
+        **kwargs: Any,
+    ) -> None:
+        """Alias for publish to support send() callers across services."""
+        await self.publish(
+            topic=topic,
+            key=key or tenant_id or "default",
+            value=payload,
+            event_type=event_type,
+            tenant_id=tenant_id,
+            correlation_id=correlation_id,
+            **kwargs,
+        )
+
     async def publish(
         self,
         *,
@@ -261,79 +283,150 @@ HandlerType = Callable[[EventEnvelope], Coroutine[Any, Any, None]]
 
 
 class SCVRIConsumer:
-    """Async Kafka consumer that deserialises EventEnvelopes.
+    """Async Kafka consumer that deserialises EventEnvelopes or yields records directly.
 
-    Features:
-    - Automatic EventEnvelope deserialisation
-    - Dead letter routing for handler exceptions
-    - Manual commit for at-least-once guarantee
-    - Graceful shutdown via asyncio.Event
+    Supports two usage modes:
+    1. Managed callback mode:
+       consumer = SCVRIConsumer(topics=[...], group_id=..., handler=my_handler)
+       await consumer.start()
+
+    2. Async iterator / context manager mode:
+       consumer = SCVRIConsumer(topics=[...], group_id=...)
+       async with consumer:
+           async for message in consumer:
+               process(message)
     """
 
     def __init__(
         self,
         topics: list[str],
         group_id: str,
-        handler: HandlerType,
+        handler: HandlerType | None = None,
         dlq_enabled: bool = True,
         max_poll_records: int = _DEFAULT_MAX_POLL_RECORDS,
+        bootstrap_servers: str | None = None,
+        **kwargs: Any,
     ) -> None:
         self._topics = topics
         self._group_id = group_id
         self._handler = handler
         self._dlq_enabled = dlq_enabled
         self._max_poll_records = max_poll_records
+        self._bootstrap_servers = bootstrap_servers or settings.kafka_bootstrap_servers
+        self._extra_kwargs = kwargs
         self._stop_event = asyncio.Event()
-        self._consumer = None
+        self._consumer: Any = None
+        self._producer: SCVRIProducer | None = None
+        self._started = False
 
     def _build_consumer(self) -> Any:
         from aiokafka import AIOKafkaConsumer  # noqa: PLC0415
 
+        def _safe_json_deserializer(v: bytes | None) -> Any:
+            if v is None:
+                return None
+            try:
+                return json.loads(v.decode("utf-8"))
+            except Exception:
+                return v
+
         return AIOKafkaConsumer(
             *self._topics,
-            bootstrap_servers=settings.kafka_bootstrap_servers,
+            bootstrap_servers=self._bootstrap_servers,
             group_id=self._group_id,
             auto_offset_reset=_DEFAULT_AUTO_OFFSET_RESET,
             enable_auto_commit=False,
             session_timeout_ms=_DEFAULT_SESSION_TIMEOUT_MS,
             max_poll_records=self._max_poll_records,
+            value_deserializer=_safe_json_deserializer,
             **_sasl_kwargs(),
         )
 
-    async def start(self) -> None:
-        """Start consuming messages — runs until ``stop()`` is called."""
-        self._consumer = self._build_consumer()
-        await self._consumer.start()
-        log.info(
-            "kafka.consumer.started",
-            topics=self._topics,
-            group_id=self._group_id,
-        )
+    async def _ensure_started(self) -> None:
+        if not self._started:
+            if self._consumer is None:
+                self._consumer = self._build_consumer()
+            await self._consumer.start()
+            self._started = True
+            log.info(
+                "kafka.consumer.started",
+                topics=self._topics,
+                group_id=self._group_id,
+            )
 
-        producer: SCVRIProducer | None = None
-        if self._dlq_enabled:
-            producer = SCVRIProducer()
-            await producer.start()
+    async def __aenter__(self) -> "SCVRIConsumer":
+        await self._ensure_started()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.stop()
+
+    def __aiter__(self) -> "SCVRIConsumer":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._stop_event.is_set():
+            raise StopAsyncIteration
+        await self._ensure_started()
+        try:
+            msg = await self._consumer.__anext__()
+            return msg
+        except StopAsyncIteration:
+            raise
+        except Exception as exc:
+            if self._stop_event.is_set():
+                raise StopAsyncIteration
+            raise exc
+
+    async def commit(self) -> None:
+        """Commit offsets manually."""
+        if self._consumer and self._started:
+            await self._consumer.commit()
+
+    async def start(self) -> None:
+        """Start consuming messages — runs until ``stop()`` is called if handler is provided."""
+        await self._ensure_started()
+
+        if self._dlq_enabled and self._handler:
+            self._producer = SCVRIProducer()
+            await self._producer.start()
 
         try:
-            async for msg in self._consumer:
-                if self._stop_event.is_set():
-                    break
-                await self._process_message(msg, producer)
-                await self._consumer.commit()
+            if self._handler:
+                async for msg in self._consumer:
+                    if self._stop_event.is_set():
+                        break
+                    await self._process_message(msg, self._producer)
+                    await self._consumer.commit()
         finally:
-            await self._consumer.stop()
-            if producer:
-                await producer.stop()
-            log.info("kafka.consumer.stopped", group_id=self._group_id)
+            await self.stop()
 
     async def stop(self) -> None:
-        """Signal the consumer loop to stop after the current batch."""
+        """Signal consumer to stop and close underlying connections."""
         self._stop_event.set()
+        if self._consumer and self._started:
+            try:
+                await self._consumer.stop()
+            except Exception as e:
+                log.warning("kafka.consumer.stop_error", error=str(e))
+            self._started = False
+        if self._producer:
+            try:
+                await self._producer.stop()
+            except Exception as e:
+                log.warning("kafka.producer.stop_error", error=str(e))
+            self._producer = None
+        log.info("kafka.consumer.stopped", group_id=self._group_id)
 
     async def _process_message(self, msg: Any, producer: SCVRIProducer | None) -> None:
         try:
-            envelope = EventEnvelope.from_json(msg.value)
+            if isinstance(msg.value, dict):
+                envelope = EventEnvelope(**msg.value)
+            elif isinstance(msg.value, (bytes, bytearray)):
+                envelope = EventEnvelope.from_json(msg.value)
+            else:
+                envelope = EventEnvelope.from_json(str(msg.value).encode("utf-8"))
+
             log.debug(
                 "kafka.message.received",
                 topic=msg.topic,
@@ -342,7 +435,8 @@ class SCVRIConsumer:
                 event_type=envelope.event_type,
                 event_id=envelope.event_id,
             )
-            await self._handler(envelope)
+            if self._handler:
+                await self._handler(envelope)
         except Exception as exc:  # noqa: BLE001
             log.error(
                 "kafka.handler_failed",
@@ -354,17 +448,18 @@ class SCVRIConsumer:
             if producer and self._dlq_enabled:
                 try:
                     dlq_topic = f"{msg.topic}.dlq"
+                    raw_val = json.dumps(msg.value) if isinstance(msg.value, dict) else (msg.value.decode("utf-8") if isinstance(msg.value, (bytes, bytearray)) else str(msg.value))
                     await producer.publish(
                         topic=dlq_topic,
-                        key=msg.key.decode("utf-8") if msg.key else "unknown",
+                        key=msg.key.decode("utf-8") if isinstance(msg.key, (bytes, bytearray)) else str(msg.key or "unknown"),
                         value={
-                            "original_raw": msg.value.decode("utf-8") if msg.value else None,
+                            "original_raw": raw_val,
                             "error": str(exc),
                             "topic": msg.topic,
                             "partition": msg.partition,
                             "offset": msg.offset,
                         },
-                        event_type=f"dlq.handler_error",
+                        event_type="dlq.handler_error",
                         retries=1,
                     )
                 except Exception as dlq_exc:  # noqa: BLE001

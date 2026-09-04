@@ -146,7 +146,7 @@ class Shipment(Base, UUIDPrimaryKeyMixin, TenantMixin, TimestampMixin):
     purchase_order: Mapped[PurchaseOrder] = relationship(
         "PurchaseOrder", back_populates="shipments", lazy="noload"
     )
-    supplier: Mapped[Supplier] = relationship("Supplier", lazy="noload")
+    supplier: Mapped[Supplier] = relationship("Supplier", lazy="noload", overlaps="purchase_order,shipments")
     events: Mapped[list[ShipmentEvent]] = relationship(
         "ShipmentEvent",
         back_populates="shipment",

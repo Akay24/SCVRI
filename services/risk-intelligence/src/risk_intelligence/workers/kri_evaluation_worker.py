@@ -71,7 +71,7 @@ async def _async_evaluate_kris() -> dict:
             if tenant_id is None:
                 continue  # global definitions without tenant scope — skip automatic eval
 
-            await db.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+            await db.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
 
             # Get all active suppliers for this tenant
             suppliers = (await db.execute(text("""

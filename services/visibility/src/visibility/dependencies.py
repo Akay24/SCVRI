@@ -20,7 +20,7 @@ ROLES_WITH_WRITE_ACCESS: frozenset[str] = frozenset(
 # ── DB engine (module-level singleton) ────────────────────────────────────────
 
 _engine = create_async_engine(
-    str(settings.database_url),
+    str(settings.async_database_url),
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=5,
@@ -40,7 +40,7 @@ async def get_tenant_db(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> AsyncSession:  # type: ignore[return]
     tenant_id: uuid.UUID = request.state.tenant_id
-    await db.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+    await db.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
     yield db
 
 

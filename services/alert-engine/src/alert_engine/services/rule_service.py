@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scvri_shared.exceptions import NotFoundError
 from scvri_shared.logging import get_logger
 from alert_engine.schemas.rule import AlertRuleCreate, AlertRuleResponse, AlertRuleUpdate
+from alert_engine.services import alert_service
 
 log = get_logger(__name__)
 
@@ -226,7 +227,6 @@ async def evaluate_event_rules(
         description = _render_template(rule.alert_description_template, event_payload)
 
         from alert_engine.schemas.alert import AlertCreate  # noqa: PLC0415
-        from alert_engine.services import alert_service  # noqa: PLC0415
 
         supplier_id = _extract_supplier_id(event_payload)
 

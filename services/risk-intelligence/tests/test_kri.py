@@ -19,9 +19,13 @@ class TestEvaluateThreshold:
             "is_inverted": is_inverted,
         }
 
-    def _eval(self, value: float, green: float, amber: float, inverted: bool) -> str:
+    def _eval(self, value: float, green: float = 0.0, amber: float = 0.0, inverted: bool = False, **kwargs) -> str:
         from risk_intelligence.services.kri_service import _evaluate_threshold  # noqa: PLC0415
-        return _evaluate_threshold(value, self._kri(green, amber, inverted))
+        green_val = kwargs.get("green_threshold", green)
+        amber_val = kwargs.get("amber_threshold", amber)
+        inv_val = kwargs.get("is_inverted", inverted)
+        return _evaluate_threshold(value, self._kri(green_val, amber_val, inv_val))
+
 
     # Non-inverted: higher value = worse
     def test_non_inverted_green(self):

@@ -127,8 +127,29 @@ spec:
                 name: visibility
                 port:
                   number: 8003
+          - path: /api/v1/purchase-orders(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: visibility
+                port:
+                  number: 8003
+          - path: /api/v1/telemetry(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: visibility
+                port:
+                  number: 8003
           # Alert Engine
           - path: /api/v1/alerts(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: alert-engine
+                port:
+                  number: 8004
+          - path: /api/v1/rules(/|$)(.*)
             pathType: ImplementationSpecific
             backend:
               service:

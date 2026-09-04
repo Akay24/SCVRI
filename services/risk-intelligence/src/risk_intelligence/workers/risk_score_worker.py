@@ -79,7 +79,7 @@ async def _async_compute(
 
     async with async_session() as db:
         async with db.begin():
-            await db.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+            await db.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
             row = await risk_scoring_service.compute_risk_score(
                 db, tenant_id, supplier_id, force_recompute=force_recompute
             )

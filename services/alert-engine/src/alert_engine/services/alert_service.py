@@ -22,6 +22,7 @@ from alert_engine.schemas.alert import (
     AlertSuppressRequest,
     AlertUpdate,
 )
+from alert_engine.workers.notification_worker import dispatch_alert_notifications_task
 
 log = get_logger(__name__)
 
@@ -69,7 +70,6 @@ async def create_alert(
 
     if not skip_notification:
         # Enqueue notification dispatch asynchronously
-        from alert_engine.workers.notification_worker import dispatch_alert_notifications_task  # noqa: PLC0415
         dispatch_alert_notifications_task.delay(
             str(alert_id), str(tenant_id), "alert_created"
         )
@@ -223,7 +223,7 @@ async def resolve_alert(
             updated_at       = now()
         WHERE id = :id AND tenant_id = :tenant_id
     """), {
-        "notes": data.resolution_notes,
+        "notes": data.resolution_notes or data.resolution_note,
         "id": str(alert_id),
         "tenant_id": str(tenant_id),
     })
@@ -233,7 +233,6 @@ async def resolve_alert(
     log.info("alert.resolved", alert_id=str(alert_id), by=str(user_id))
 
     # Notify resolution
-    from alert_engine.workers.notification_worker import dispatch_alert_notifications_task  # noqa: PLC0415
     dispatch_alert_notifications_task.delay(str(alert_id), str(tenant_id), "alert_resolved")
 
     # Kafka
@@ -307,7 +306,6 @@ async def escalate_alert(
     updated = await get_alert(db, tenant_id, alert_id)
     log.info("alert.escalated", alert_id=str(alert_id), to=str(data.escalate_to_user_id))
 
-    from alert_engine.workers.notification_worker import dispatch_alert_notifications_task  # noqa: PLC0415
     dispatch_alert_notifications_task.delay(str(alert_id), str(tenant_id), "alert_escalated")
 
     return updated
@@ -337,7 +335,6 @@ async def auto_escalate_stale_alerts(
     await db.commit()
 
     for aid in escalated_ids:
-        from alert_engine.workers.notification_worker import dispatch_alert_notifications_task  # noqa: PLC0415
         dispatch_alert_notifications_task.delay(str(aid), str(tenant_id), "alert_escalated")
 
     if escalated_ids:

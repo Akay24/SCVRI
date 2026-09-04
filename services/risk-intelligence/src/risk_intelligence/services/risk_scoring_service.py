@@ -13,6 +13,7 @@ from scvri_shared.logging import get_logger
 from scvri_shared.models.risk import SupplierRiskScore
 from risk_intelligence.ml.feature_engineering import assemble_feature_vector
 from risk_intelligence.ml.predictor import predict, score_to_level
+from risk_intelligence.workers.risk_score_worker import compute_risk_score_task
 from risk_intelligence.schemas.risk_score import (
     BulkRiskScoreRequest,
     SupplierRiskScoreResponse,
@@ -213,8 +214,6 @@ async def bulk_compute_risk_scores(
 
     Returns a mapping of supplier_id → task_id.
     """
-    from risk_intelligence.workers.risk_score_worker import compute_risk_score_task  # noqa: PLC0415
-
     task_map: dict[str, str] = {}
     for sid in supplier_ids:
         task = compute_risk_score_task.delay(

@@ -24,7 +24,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
 
 from scvri_shared.models.base import (
     Base,
@@ -121,9 +121,11 @@ class SupplierRiskScore(Base, UUIDPrimaryKeyMixin, TenantMixin, TimestampMixin):
     scored_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    computed_at = synonym("scored_at")
     next_scheduled_rescore: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
 
     # ------------------------------------------------------------------ #
     # Relationships
@@ -218,19 +220,25 @@ class KRISnapshot(Base, UUIDPrimaryKeyMixin, TenantMixin):
     )
 
     kri_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    kri_definition_id = synonym("kri_id")
     supplier_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     snapshot_date: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )  # partition key
+    measured_at = synonym("snapshot_date")
     value: Mapped[Decimal] = mapped_column(Numeric(14, 4), nullable=False)
+    status: Mapped[str | None] = mapped_column(String(20), nullable=True, server_default="green")
     breach_level: Mapped[str | None] = mapped_column(
         Enum("warning", "critical", name="breach_level_enum", schema="risk"), nullable=True
     )
     source: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    raw_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    recorded_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     definition: Mapped[KRIDefinition] = relationship(
         "KRIDefinition", back_populates="snapshots", lazy="noload"
     )
+
 
 
 class RiskRule(Base, UUIDPrimaryKeyMixin, TenantMixin, TimestampMixin):

@@ -176,6 +176,16 @@ class NotFoundError(SCVRIException):
 # ---------------------------------------------------------------------------
 # 409 Conflict
 # ---------------------------------------------------------------------------
+class ConflictError(SCVRIException):
+    """Resource conflict (e.g. duplicate key, already exists)."""
+
+    status_code = 409
+    error_code = "CONFLICT"
+
+    def __init__(self, message: str = "Resource conflict.", detail: Any | None = None) -> None:
+        super().__init__(message, error_code="CONFLICT", detail=detail)
+
+
 class StateTransitionError(SCVRIException):
     """Invalid state machine transition."""
 

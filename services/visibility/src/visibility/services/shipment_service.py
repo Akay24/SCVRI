@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scvri_shared.exceptions import NotFoundError, BusinessRuleError
 from scvri_shared.kafka import get_producer
+from scvri_shared.outbox_relay import schedule_outbox_event
 from scvri_shared.logging import get_logger
 from visibility.schemas.shipment import (
     ETAPredictionResponse,
@@ -219,22 +220,41 @@ async def add_tracking_event(
         "tenant_id": str(tenant_id),
     })
 
+    # Schedule Outbox event for zero-loss reliable delivery
+    await schedule_outbox_event(
+        db,
+        tenant_id=tenant_id,
+        topic="visibility.events",
+        event_type="shipment.status.updated",
+        payload={
+            "shipment_id": str(data.shipment_id),
+            "event_type": data.event_type,
+            "new_status": new_status,
+            "location": data.location,
+            "occurred_at": data.occurred_at.isoformat(),
+        },
+        event_key=str(data.shipment_id),
+    )
+
     await db.commit()
 
-    # Kafka
-    async with get_producer() as producer:
-        await producer.send(
-            topic="visibility.events",
-            event_type="shipment.status.updated",
-            payload={
-                "shipment_id": str(data.shipment_id),
-                "event_type": data.event_type,
-                "new_status": new_status,
-                "location": data.location,
-                "occurred_at": data.occurred_at.isoformat(),
-            },
-            tenant_id=str(tenant_id),
-        )
+    # Opportunistic Kafka dispatch
+    try:
+        async with get_producer() as producer:
+            await producer.send(
+                topic="visibility.events",
+                event_type="shipment.status.updated",
+                payload={
+                    "shipment_id": str(data.shipment_id),
+                    "event_type": data.event_type,
+                    "new_status": new_status,
+                    "location": data.location,
+                    "occurred_at": data.occurred_at.isoformat(),
+                },
+                tenant_id=str(tenant_id),
+            )
+    except Exception as exc:
+        log.warning("shipment_event_direct_publish_failed_relaying_via_outbox", error=str(exc))
 
     log.info(
         "shipment.tracking_event",
@@ -315,15 +335,17 @@ async def predict_eta(
     delay_factors: list[str] = []
     delay_risk = "low"
 
+    if shipment.status in ("customs_hold", "exception"):
+        delay_factors.append(f"Shipment in status '{shipment.status}'")
+        delay_risk = "high"
+
     if current_eta and predicted > current_eta + timedelta(days=3):
         delay_factors.append("Predicted arrival exceeds ETA by more than 3 days")
         delay_risk = "high"
-    elif shipment.status in ("customs_hold", "exception"):
-        delay_factors.append(f"Shipment in status '{shipment.status}'")
-        delay_risk = "high"
     elif current_eta and predicted > current_eta:
         delay_factors.append("Slight delay vs ETA")
-        delay_risk = "medium"
+        if delay_risk != "high":
+            delay_risk = "medium"
 
     return ETAPredictionResponse(
         shipment_id=shipment_id,

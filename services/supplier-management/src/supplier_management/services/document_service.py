@@ -27,6 +27,7 @@ from supplier_management.schemas.document import (
     PresignedUploadRequest,
     PresignedUploadResponse,
 )
+from supplier_management.services.supplier_service import get_supplier
 
 log = get_logger(__name__)
 
@@ -59,9 +60,6 @@ async def generate_presigned_upload_url(
     user_id: uuid.UUID,
     req: PresignedUploadRequest,
 ) -> PresignedUploadResponse:
-    """Generate a presigned S3 POST URL and save a pending document row."""
-    from supplier_management.services.supplier_service import get_supplier  # noqa: PLC0415
-
     # Verify supplier exists and belongs to tenant
     await get_supplier(db, tenant_id, supplier_id)
 

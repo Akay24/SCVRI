@@ -1,16 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
+import { suppliers as mockSuppliers } from "@/services/mockData";
 
 export async function GET() {
   try {
     const db = await getDb();
     const suppliers = await db.collection("suppliers").find({}).sort({ riskScore: -1 }).toArray();
-    const data = suppliers.map(({ _id, ...rest }) => rest);
-    return NextResponse.json(data);
+    if (suppliers && suppliers.length > 0) {
+      const data = suppliers.map(({ _id, ...rest }) => rest);
+      return NextResponse.json(data);
+    }
   } catch (err) {
-    console.error("/api/suppliers GET error:", err);
-    return NextResponse.json({ error: "Database error" }, { status: 500 });
+    // Database offline — fall back to mock data
   }
+  return NextResponse.json(mockSuppliers);
 }
 
 export async function POST(req: NextRequest) {

@@ -154,6 +154,10 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in v.split(",")]
         return v
 
+    @property
+    def s3_supplier_documents_bucket(self) -> str:
+        return self.s3_supplier_docs_bucket
+
 
 @functools.lru_cache(maxsize=1)
 def get_settings() -> Settings:

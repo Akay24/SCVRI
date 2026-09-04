@@ -21,6 +21,7 @@ dependencies = [
     "pyotp==2.9.0",                        # TOTP MFA (RFC 6238)
     "qrcode[pil]==8.0",                    # QR code for TOTP provisioning URI
     "httpx==0.28.1",
+    "email-validator>=2.0.0",
     "scvri-shared @ {root:uri}/../../shared",
 ]
 

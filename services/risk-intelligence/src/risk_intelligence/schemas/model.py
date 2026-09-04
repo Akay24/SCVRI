@@ -5,10 +5,13 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
+from pydantic import Field
 from scvri_shared.schemas import CamelBase
+
 
 ModelStatus = Literal["staging", "champion", "challenger", "archived", "failed"]
 ModelFramework = Literal["xgboost", "lightgbm", "sklearn", "rule_based"]
+
 
 
 class ModelArtifactUploadRequest(CamelBase):
@@ -64,8 +67,8 @@ class ModelPredictResponse(CamelBase):
 
 class FeatureVector(CamelBase):
     """Assembled feature vector before model inference."""
-    supplier_id: uuid.UUID
-    tenant_id: uuid.UUID
+    supplier_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    tenant_id: uuid.UUID = Field(default_factory=uuid.uuid4)
     # Scorecard-derived (operational)
     otd_rate: float = 50.0
     fill_rate: float = 50.0

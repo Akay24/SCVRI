@@ -147,7 +147,7 @@ class TenantResolutionMiddleware(BaseHTTPMiddleware):
         except AuthenticationError as exc:
             return _problem_response(401, exc.error_code, exc.message)
 
-        tenant_id = payload.get("tid")
+        tenant_id = payload.get("tid") or payload.get("tenant_id")
         user_id = payload.get("sub")
         if not tenant_id or not user_id:
             return _problem_response(401, "AUTHENTICATION_FAILED", "Token missing tenant or subject claim.")
@@ -301,3 +301,9 @@ def register_middleware(app: ASGIApp) -> None:
 
     # Global exception handler
     app.add_exception_handler(SCVRIException, scvri_exception_handler)  # type: ignore[arg-type]
+
+
+# Backward-compatible middleware aliases
+RequestIDMiddleware = CorrelationIDMiddleware
+TenantRLSMiddleware = TenantResolutionMiddleware
+

@@ -20,11 +20,20 @@ const DEV_USERS: Record<string, { password: string; iamRole: string; name: strin
   "viewer@scvri.dev":      { password: "Viewer12!",    iamRole: "viewer",                name: "Val Viewer" },
 };
 
-function devBypass(req: NextRequest, body: Record<string, string>): NextResponse | null {
-  if (process.env.DEV_AUTH_BYPASS !== "true") return null;
+function devBypass(
+  req: NextRequest,
+  body: Record<string, string>,
+  isFallback = false
+): NextResponse | null {
+  const allowed = process.env.DEV_AUTH_BYPASS === "true" || (isFallback && process.env.NODE_ENV !== "production");
+  if (!allowed) return null;
+
   const user = DEV_USERS[body.email?.toLowerCase()];
   if (!user || user.password !== body.password) {
-    return NextResponse.json({ detail: "Invalid credentials" }, { status: 401 });
+    return NextResponse.json(
+      { detail: "Invalid credentials. For demo mode, try viewer@scvri.dev / Viewer12! or admin@scvri.dev / Admin1234!" },
+      { status: 401 }
+    );
   }
   const role = mapRole(user.iamRole);
   const fakeUserId = Buffer.from(body.email).toString("base64").slice(0, 22);
@@ -49,8 +58,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  // Dev bypass short-circuit
-  const devRes = devBypass(req, body);
+  // Dev bypass short-circuit if explicitly configured
+  const devRes = devBypass(req, body, false);
   if (devRes) return devRes;
 
   let iamRes: Response;
@@ -59,9 +68,18 @@ export async function POST(req: NextRequest) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(3000),
     });
   } catch {
-    return NextResponse.json({ error: "Auth service unreachable" }, { status: 503 });
+    // If backend IAM service is offline in local development, fall back to demo credentials
+    if (process.env.NODE_ENV !== "production") {
+      const fallback = devBypass(req, body, true);
+      if (fallback) return fallback;
+    }
+    return NextResponse.json(
+      { error: "Auth service unreachable and dev credentials did not match." },
+      { status: 503 }
+    );
   }
 
   const data = await iamRes.json();

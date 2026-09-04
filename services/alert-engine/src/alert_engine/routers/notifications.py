@@ -4,8 +4,9 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
+
 
 from alert_engine.dependencies import (
     TenantDB,
@@ -81,15 +82,17 @@ async def update_channel(
     )
 
 
-@router.delete("/channels/{channel_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/channels/{channel_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response, response_model=None)
 async def delete_channel(
     channel_id: uuid.UUID,
     db: DbDep,
     tenant_id: TenantID,
     _: AdminDep,
-) -> None:
+) -> Response:
     """Deactivate a channel (admin only)."""
     await notification_service.delete_channel(db, tenant_id, channel_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 
 @router.post("/channels/{channel_id}/test")

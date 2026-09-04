@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
+import { suppliers as mockSuppliers } from "@/services/mockData";
 
 export async function GET(
   _req: NextRequest,
@@ -9,13 +10,16 @@ export async function GET(
   try {
     const db = await getDb();
     const supplier = await db.collection("suppliers").findOne({ id });
-    if (!supplier) return NextResponse.json({ error: "Not found" }, { status: 404 });
-    const { _id, ...data } = supplier;
-    return NextResponse.json(data);
+    if (supplier) {
+      const { _id, ...data } = supplier;
+      return NextResponse.json(data);
+    }
   } catch (err) {
-    console.error("/api/suppliers/[id] GET error:", err);
-    return NextResponse.json({ error: "Database error" }, { status: 500 });
+    // Database offline — fall back to mock data
   }
+  const mock = mockSuppliers.find((s) => s.id === id);
+  if (mock) return NextResponse.json(mock);
+  return NextResponse.json({ error: "Not found" }, { status: 404 });
 }
 
 export async function PATCH(

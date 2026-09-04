@@ -114,12 +114,13 @@ def create_app() -> FastAPI:
         scorecards,
         suppliers,
     )
-    API_PREFIX = "/v1/suppliers"
-    application.include_router(suppliers.router, prefix=API_PREFIX, tags=["Suppliers"])
-    application.include_router(contacts.router, prefix=API_PREFIX, tags=["Contacts"])
-    application.include_router(documents.router, prefix=API_PREFIX, tags=["Documents"])
-    application.include_router(scorecards.router, prefix=API_PREFIX, tags=["Scorecards"])
-    application.include_router(onboarding.router, prefix=API_PREFIX, tags=["Onboarding"])
+    API_PREFIXES = ["/api/v1/suppliers", "/v1/suppliers"]
+    for prefix in API_PREFIXES:
+        application.include_router(suppliers.router, prefix=prefix, tags=["Suppliers"])
+        application.include_router(contacts.router, prefix=prefix, tags=["Contacts"])
+        application.include_router(documents.router, prefix=prefix, tags=["Documents"])
+        application.include_router(scorecards.router, prefix=prefix, tags=["Scorecards"])
+        application.include_router(onboarding.router, prefix=prefix, tags=["Onboarding"])
 
     # Health endpoints (no auth required)
     _register_health_routes(application)

@@ -48,23 +48,28 @@ def create_app() -> FastAPI:
     # ── Routers ─────────────────────────────────────────────────────────────
     from risk_intelligence.routers import risk_scores, kri, models  # noqa: PLC0415
 
-    # Supplier-scoped risk & KRI endpoints
-    app.include_router(
-        risk_scores.router,
-        prefix="/v1/suppliers",
-        tags=["Risk Scores"],
-    )
-    app.include_router(
-        kri.router,
-        prefix="/v1/suppliers",
-        tags=["KRI"],
-    )
-    # Model registry (not supplier-scoped)
-    app.include_router(
-        models.router,
-        prefix="/v1",
-        tags=["Model Registry"],
-    )
+    # Supplier-scoped risk & KRI endpoints under /api/v1 and legacy /v1
+    for prefix in ("/api/v1", "/v1"):
+        app.include_router(
+            risk_scores.router,
+            prefix=f"{prefix}/suppliers",
+            tags=["Risk Scores"],
+        )
+        app.include_router(
+            kri.router,
+            prefix=f"{prefix}/suppliers",
+            tags=["KRI"],
+        )
+        app.include_router(
+            risk_scores.router,
+            prefix=f"{prefix}/risk/suppliers",
+            tags=["Risk Scores"],
+        )
+        app.include_router(
+            models.router,
+            prefix=prefix,
+            tags=["Model Registry"],
+        )
 
     # ── Utility endpoints ────────────────────────────────────────────────────
     @app.get("/health", tags=["Ops"], summary="Liveness probe")

@@ -34,7 +34,7 @@ def _get_sync_db_session(tenant_id_str: str):
 
     engine = create_engine(str(settings.database_url_sync), pool_pre_ping=True)
     sess = Session(engine)
-    sess.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id_str}'"))
+    sess.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id_str)})
     return sess
 
 
@@ -73,7 +73,7 @@ def compute_supplier_scorecard(
     engine = create_engine(str(settings.database_url_sync), pool_pre_ping=True)
 
     with Session(engine) as sess:
-        sess.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+        sess.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
 
         # Aggregate delivery metrics from purchase orders + shipments
         row = sess.execute(text("""
@@ -169,7 +169,7 @@ def scan_document_task(self, document_id: str, tenant_id: str) -> dict:
     engine = create_engine(str(settings.database_url_sync), pool_pre_ping=True)
 
     with Session(engine) as sess:
-        sess.execute(text(f"SET LOCAL scvri.tenant_id = '{tenant_id}'"))
+        sess.execute(text("SET LOCAL scvri.tenant_id = :tid"), {"tid": str(tenant_id)})
 
         doc = sess.execute(
             select(SupplierDocument).where(SupplierDocument.id == uuid.UUID(document_id))

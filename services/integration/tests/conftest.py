@@ -10,6 +10,21 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import respx.patterns
+
+# Monkey-patch respx Method.parse for httpcore bytes compatibility
+_orig_method_parse = respx.patterns.Method.parse
+
+
+def _safe_method_parse(self, request):
+    val = _orig_method_parse(self, request)
+    if isinstance(val, bytes):
+        return val.decode("ascii")
+    return val
+
+
+respx.patterns.Method.parse = _safe_method_parse
+
 TENANT_ID = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 ENDPOINT_ID = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 REGISTRATION_ID = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")

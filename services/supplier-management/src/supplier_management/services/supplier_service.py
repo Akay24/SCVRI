@@ -27,6 +27,7 @@ from scvri_shared.exceptions import (
 from scvri_shared.kafka import get_producer
 from scvri_shared.logging import get_logger
 from scvri_shared.models.supplier import Certification, Contact, Supplier
+from scvri_shared.outbox_relay import schedule_outbox_event
 from supplier_management.schemas.supplier import (
     BulkSupplierStatusUpdate,
     CertificationCreate,
@@ -40,6 +41,37 @@ from supplier_management.schemas.supplier import (
 )
 
 log = get_logger(__name__)
+
+
+async def _emit_event(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    topic: str,
+    event_type: str,
+    payload: dict[str, Any],
+    key: str | None = None,
+) -> None:
+    """Schedule event into Transactional Outbox and attempt producer dispatch."""
+    await schedule_outbox_event(
+        db,
+        tenant_id=tenant_id,
+        topic=topic,
+        event_type=event_type,
+        payload=payload,
+        event_key=key,
+    )
+    try:
+        async with get_producer() as producer:
+            await producer.publish(
+                topic=topic,
+                key=key or str(tenant_id),
+                value=payload,
+                event_type=event_type,
+                tenant_id=str(tenant_id),
+            )
+    except Exception as exc:
+        log.debug("outbox.producer_direct_publish_deferred", error=str(exc))
+
 
 # ---------------------------------------------------------------------------
 # Valid onboarding state transitions
@@ -121,14 +153,15 @@ async def create_supplier(
 
     await db.flush()
 
-    # Emit Kafka event
-    async with get_producer() as producer:
-        await producer.publish(
-            topic="supplier.events",
-            key=str(supplier.id),
-            value={"supplier_id": str(supplier.id), "tenant_id": str(tenant_id)},
-            event_type="supplier.created",
-        )
+    # Emit event via Transactional Outbox
+    await _emit_event(
+        db,
+        tenant_id=tenant_id,
+        topic="supplier.events",
+        event_type="supplier.created",
+        payload={"supplier_id": str(supplier.id), "tenant_id": str(tenant_id)},
+        key=str(supplier.id),
+    )
 
     log.info("supplier.created", supplier_id=str(supplier.id), tenant_id=str(tenant_id))
     return supplier
@@ -175,13 +208,14 @@ async def update_supplier(
 
     supplier.updated_at = datetime.now(tz=timezone.utc)
 
-    async with get_producer() as producer:
-        await producer.publish(
-            topic="supplier.events",
-            key=str(supplier.id),
-            value={"supplier_id": str(supplier.id), "tenant_id": str(tenant_id), "fields": list(patch.keys())},
-            event_type="supplier.updated",
-        )
+    await _emit_event(
+        db,
+        tenant_id=tenant_id,
+        topic="supplier.events",
+        event_type="supplier.updated",
+        payload={"supplier_id": str(supplier.id), "tenant_id": str(tenant_id), "fields": list(patch.keys())},
+        key=str(supplier.id),
+    )
 
     log.info("supplier.updated", supplier_id=str(supplier_id), fields=list(patch.keys()))
     return supplier
@@ -199,13 +233,14 @@ async def soft_delete_supplier(
     supplier.status = "inactive"
     supplier.updated_at = datetime.now(tz=timezone.utc)
 
-    async with get_producer() as producer:
-        await producer.publish(
-            topic="supplier.events",
-            key=str(supplier.id),
-            value={"supplier_id": str(supplier.id), "tenant_id": str(tenant_id)},
-            event_type="supplier.deleted",
-        )
+    await _emit_event(
+        db,
+        tenant_id=tenant_id,
+        topic="supplier.events",
+        event_type="supplier.deleted",
+        payload={"supplier_id": str(supplier.id), "tenant_id": str(tenant_id)},
+        key=str(supplier.id),
+    )
 
     log.info("supplier.soft_deleted", supplier_id=str(supplier_id))
 
@@ -309,20 +344,21 @@ async def transition_onboarding(
     elif to_state in {"rejected", "inactive"}:
         supplier.status = "inactive"
 
-    async with get_producer() as producer:
-        await producer.publish(
-            topic="supplier.events",
-            key=str(supplier.id),
-            value={
-                "supplier_id": str(supplier.id),
-                "tenant_id": str(tenant_id),
-                "from_status": from_state,
-                "to_status": to_state,
-                "reason": req.reason,
-                "metadata": req.metadata,
-            },
-            event_type="supplier.onboarding.transitioned",
-        )
+    await _emit_event(
+        db,
+        tenant_id=tenant_id,
+        topic="supplier.events",
+        event_type="supplier.onboarding.transitioned",
+        payload={
+            "supplier_id": str(supplier.id),
+            "tenant_id": str(tenant_id),
+            "from_status": from_state,
+            "to_status": to_state,
+            "reason": req.reason,
+            "metadata": req.metadata,
+        },
+        key=str(supplier.id),
+    )
 
     log.info(
         "supplier.onboarding.transitioned",
@@ -361,17 +397,18 @@ async def bulk_update_status(
     updated_ids = result.scalars().all()
     count = len(updated_ids)
 
-    async with get_producer() as producer:
-        await producer.publish(
-            topic="supplier.events",
-            key=str(tenant_id),
-            value={
-                "tenant_id": str(tenant_id),
-                "supplier_ids": [str(i) for i in updated_ids],
-                "new_status": data.status,
-            },
-            event_type="supplier.bulk_status_updated",
-        )
+    await _emit_event(
+        db,
+        tenant_id=tenant_id,
+        topic="supplier.events",
+        event_type="supplier.bulk_status_updated",
+        payload={
+            "tenant_id": str(tenant_id),
+            "supplier_ids": [str(i) for i in updated_ids],
+            "new_status": data.status,
+        },
+        key=str(tenant_id),
+    )
 
     log.info("supplier.bulk_update_status", count=count, new_status=data.status)
     return count
